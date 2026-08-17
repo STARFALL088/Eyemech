@@ -1,0 +1,23 @@
+Eyemech/
+│
+├── firmware/          # Embedded/control code
+│   ├── src/
+│   ├── include/
+│   └── README.md
+│
+├── hardware/          # Circuit diagrams and hardware documentation
+│   ├── schematics/
+│   ├── wiring/
+│   └── README.md
+│
+├── mechanical/        # 3D models and mechanical documentation
+│   ├── models/
+│   └── README.md
+│
+├── docs/              # Project documentation
+│
+├── images/            # Project photos and diagrams
+│
+├── tests/             # Hardware/software testing
+│
+└── README.md
