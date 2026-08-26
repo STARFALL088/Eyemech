@@ -1,0 +1,9 @@
+# Eyemech Python/OpenCV side — dependencies
+# Install:  pip install -r requirements.txt
+
+# Pin <5: OpenCV 5.0 removed the legacy Haar CascadeClassifier API this
+# project relies on. 4.x keeps it. On a desktop with a webcam, use the GUI
+# build `opencv-python` instead of `-headless`.
+opencv-python-headless>=4.7,<5   # camera/cascade detection (headless: no GUI window)
+numpy>=1.21                 # array math used by the trackers
+pyserial>=3.5               # USB-serial bridge to the Arduino (not needed for --mock)
