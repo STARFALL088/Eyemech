@@ -3,17 +3,14 @@
 Eyemech — Direct mouse control pad (no webcam)
 ==============================================
 
-Tkinter UI matching the EyeMech Control Interface sketch:
-  * large circle = orthographic disk of a sphere with diameter d
-  * red marker follows the mouse (clamped to the disk)
-  * center = (0, 0); +x = right, +y = up
-  * arc-length angles:  s = r * theta  =>  theta = s / r
-    so theta_right = x / r,  theta_up = y / r  (radians)
+Tkinter UI:
+  * Port / Connect bar
+  * Arrow nudges + Home (set current pose as gaze zero)
+  * Circle pad: theta = s/r → degrees over serial
 
-When Connected, each gaze sample is also sent to the Arduino firmware as:
-  "<right_deg>,<up_deg>\\n"
-matching software/firmware/firmware.ino (9600 baud). Firmware clamps with
-safe_turn() to ±MAX_TURN_ANGLE.
+Protocol (9600 baud), same as firmware:
+  "<right_deg>,<up_deg>\\n"   gaze (after zero offset)
+  "HOME\\n"                   park mechanical v=0 on clean disconnect
 """
 
 from __future__ import annotations
@@ -32,16 +29,18 @@ except ImportError:  # pragma: no cover
     comports = None  # type: ignore
 
 
-# Canvas / circle layout (pixels)
 CANVAS_SIZE = 420
 MARGIN = 28
-CIRCLE_DIAMETER = CANVAS_SIZE - 2 * MARGIN  # d
-CIRCLE_RADIUS = CIRCLE_DIAMETER / 2.0        # r
+CIRCLE_DIAMETER = CANVAS_SIZE - 2 * MARGIN
+CIRCLE_RADIUS = CIRCLE_DIAMETER / 2.0
 DOT_RADIUS = 5
 
 BAUD = 9600
-# Don't flood the Arduino USB-serial buffer on every pixel of mouse motion.
-SEND_INTERVAL_S = 0.02  # 50 Hz
+SEND_INTERVAL_S = 0.02
+NUDGE_DEG = 0.5
+# Match firmware host-degree edges (from calib_limits).
+MAX_TURN_X = 14.0
+MAX_TURN_Y = 4.5
 
 
 class DirectControlApp:
@@ -59,12 +58,18 @@ class DirectControlApp:
         self._last_send_t = 0.0
         self._last_sent: Optional[Tuple[float, float]] = None
 
+        # Gaze zero: absolute degrees sent when pad/pupil reports (0,0).
+        self._zero_r = 0.0
+        self._zero_u = 0.0
+        self._gaze_r = 0.0
+        self._gaze_u = 0.0
+
         self._build_chrome()
+        self._build_calib_bar()
         self._build_canvas()
         self._refresh_ports()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-    # ------------------------------------------------------------------ UI
     def _build_chrome(self) -> None:
         bar = ttk.Frame(self.root, padding=(8, 6))
         bar.pack(fill=tk.X)
@@ -87,6 +92,27 @@ class DirectControlApp:
         self.status_var = tk.StringVar(value="Not Connected")
         ttk.Label(bar, textvariable=self.status_var).pack(side=tk.LEFT)
 
+    def _build_calib_bar(self) -> None:
+        bar = ttk.Frame(self.root, padding=(8, 0))
+        bar.pack(fill=tk.X)
+
+        ttk.Label(bar, text="Calib:").pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(bar, text="←", width=3, command=lambda: self._nudge(-NUDGE_DEG, 0)).pack(
+            side=tk.LEFT, padx=1
+        )
+        ttk.Button(bar, text="→", width=3, command=lambda: self._nudge(+NUDGE_DEG, 0)).pack(
+            side=tk.LEFT, padx=1
+        )
+        ttk.Button(bar, text="↑", width=3, command=lambda: self._nudge(0, +NUDGE_DEG)).pack(
+            side=tk.LEFT, padx=1
+        )
+        ttk.Button(bar, text="↓", width=3, command=lambda: self._nudge(0, -NUDGE_DEG)).pack(
+            side=tk.LEFT, padx=1
+        )
+        ttk.Button(bar, text="Home", command=self._set_zero).pack(side=tk.LEFT, padx=(8, 4))
+        self.zero_var = tk.StringVar(value="zero=(+0.0,+0.0)°")
+        ttk.Label(bar, textvariable=self.zero_var).pack(side=tk.LEFT)
+
     def _build_canvas(self) -> None:
         self.canvas = tk.Canvas(
             self.root,
@@ -96,20 +122,15 @@ class DirectControlApp:
             highlightthickness=1,
             highlightbackground="#cccccc",
         )
-        self.canvas.pack(padx=8, pady=(0, 8))
+        self.canvas.pack(padx=8, pady=(6, 8))
 
         x0 = self._cx - CIRCLE_RADIUS
         y0 = self._cy - CIRCLE_RADIUS
         x1 = self._cx + CIRCLE_RADIUS
         y1 = self._cy + CIRCLE_RADIUS
         self.canvas.create_oval(x0, y0, x1, y1, outline="black", width=2)
-
-        self.canvas.create_line(
-            x0, self._cy, x1, self._cy, fill="#9a9a9a", dash=(4, 4)
-        )
-        self.canvas.create_line(
-            self._cx, y0, self._cx, y1, fill="#9a9a9a", dash=(4, 4)
-        )
+        self.canvas.create_line(x0, self._cy, x1, self._cy, fill="#9a9a9a", dash=(4, 4))
+        self.canvas.create_line(self._cx, y0, self._cx, y1, fill="#9a9a9a", dash=(4, 4))
 
         self.dot = self.canvas.create_oval(
             self._cx - DOT_RADIUS,
@@ -119,9 +140,55 @@ class DirectControlApp:
             fill="red",
             outline="red",
         )
-
         self.canvas.bind("<Motion>", self._on_motion)
         self.canvas.bind("<Leave>", self._on_leave)
+
+    def _refresh_zero_label(self) -> None:
+        self.zero_var.set(f"zero=({self._zero_r:+.1f},{self._zero_u:+.1f})°")
+
+    def _clamp_cmd(self, r: float, u: float) -> Tuple[float, float]:
+        return (
+            max(-MAX_TURN_X, min(MAX_TURN_X, r)),
+            max(-MAX_TURN_Y, min(MAX_TURN_Y, u)),
+        )
+
+    def _nudge(self, dr: float, du: float) -> None:
+        """Tiny manual move; adjusts the zero offset and sends immediately."""
+        self._zero_r, self._zero_u = self._clamp_cmd(
+            self._zero_r + dr, self._zero_u + du
+        )
+        self._refresh_zero_label()
+        print(
+            f"[calib] nudge → zero=({self._zero_r:+.2f},{self._zero_u:+.2f})°",
+            flush=True,
+        )
+        self._send_gaze(force=True)
+
+    def _set_zero(self) -> None:
+        """Current absolute pose becomes gaze (0,0); recenter the pad."""
+        abs_r = self._zero_r + self._gaze_r
+        abs_u = self._zero_u + self._gaze_u
+        self._zero_r, self._zero_u = self._clamp_cmd(abs_r, abs_u)
+        self._gaze_r = 0.0
+        self._gaze_u = 0.0
+        self._dot_pos = (self._cx, self._cy)
+        self.canvas.coords(
+            self.dot,
+            self._cx - DOT_RADIUS,
+            self._cy - DOT_RADIUS,
+            self._cx + DOT_RADIUS,
+            self._cy + DOT_RADIUS,
+        )
+        self._refresh_zero_label()
+        print(
+            f"[calib] Home → set zero=({self._zero_r:+.2f},{self._zero_u:+.2f})°",
+            flush=True,
+        )
+        self._send_gaze(force=True)
+
+    def _send_gaze(self, force: bool = False) -> None:
+        r, u = self._clamp_cmd(self._zero_r + self._gaze_r, self._zero_u + self._gaze_u)
+        self._send_angles(r, u, force=force)
 
     # ----------------------------------------------------------- serial
     def _refresh_ports(self) -> None:
@@ -134,8 +201,15 @@ class DirectControlApp:
         elif not ports:
             self.port_var.set("")
 
-    def _disconnect(self) -> None:
+    def _disconnect(self, park_home: bool = True) -> None:
         if self._ser is not None:
+            if park_home:
+                try:
+                    self._ser.write(b"HOME\n")
+                    self._ser.flush()
+                    time.sleep(0.4)
+                except Exception:
+                    pass
             try:
                 self._ser.close()
             except Exception:
@@ -147,7 +221,7 @@ class DirectControlApp:
 
     def _toggle_connect(self) -> None:
         if self._connected:
-            self._disconnect()
+            self._disconnect(park_home=True)
             return
 
         port = self.port_var.get()
@@ -160,23 +234,21 @@ class DirectControlApp:
 
         try:
             self._ser = serial.Serial(port, BAUD, timeout=0.1)
-            time.sleep(2.0)  # Arduino auto-reset on open
+            time.sleep(2.0)
             try:
                 self._ser.reset_input_buffer()
             except Exception:
                 pass
         except Exception as exc:
             self._ser = None
-            self.status_var.set(f"Open failed")
+            self.status_var.set("Open failed")
             print(f"[direct_control] serial open failed: {exc}", flush=True)
             return
 
         self._connected = True
         self.status_var.set("Connected")
         self.connect_btn.configure(text="Disconnect")
-        # Sync firmware to current (usually center) pose.
-        th_r, th_u = self._pixel_to_angles(*self._dot_pos)
-        self._send_angles(math.degrees(th_r), math.degrees(th_u), force=True)
+        self._send_gaze(force=True)
 
     def _send_angles(self, right_deg: float, up_deg: float, force: bool = False) -> None:
         if not self._connected or self._ser is None:
@@ -194,10 +266,10 @@ class DirectControlApp:
             self._last_sent = sample
         except Exception as exc:
             print(f"[direct_control] serial write failed: {exc}", flush=True)
-            self._disconnect()
+            self._disconnect(park_home=False)
 
     def _on_close(self) -> None:
-        self._disconnect()
+        self._disconnect(park_home=True)
         self.root.destroy()
 
     # ----------------------------------------------------------- mouse / math
@@ -212,17 +284,9 @@ class DirectControlApp:
         return self._cx + dx, self._cy + dy
 
     def _pixel_to_angles(self, px: float, py: float) -> Tuple[float, float]:
-        """
-        Screen → sphere angles (radians).
-          +theta_right : rightward
-          +theta_up    : upward  (screen y grows downward, so flip)
-        s = r * theta  =>  theta = s / r
-        """
         x = px - self._cx
         y = self._cy - py
-        theta_right = x / CIRCLE_RADIUS
-        theta_up = y / CIRCLE_RADIUS
-        return theta_right, theta_up
+        return x / CIRCLE_RADIUS, y / CIRCLE_RADIUS
 
     def _move_dot(self, px: float, py: float) -> None:
         px, py = self._clamp_to_circle(px, py)
@@ -235,14 +299,16 @@ class DirectControlApp:
             py + DOT_RADIUS,
         )
         th_r, th_u = self._pixel_to_angles(px, py)
-        right_deg = math.degrees(th_r)
-        up_deg = math.degrees(th_u)
+        # Unit disk (±1 at rim) → calibrated host degrees (±MAX_TURN_*).
+        self._gaze_r = th_r * MAX_TURN_X
+        self._gaze_u = th_u * MAX_TURN_Y
         print(
-            f"right={th_r:+.4f} rad ({right_deg:+.1f}°)  "
-            f"up={th_u:+.4f} rad ({up_deg:+.1f}°)",
+            f"right={th_r:+.4f} ({self._gaze_r:+.1f}°)  "
+            f"up={th_u:+.4f} ({self._gaze_u:+.1f}°)  "
+            f"zero=({self._zero_r:+.1f},{self._zero_u:+.1f})",
             flush=True,
         )
-        self._send_angles(right_deg, up_deg)
+        self._send_gaze()
 
     def _on_motion(self, event: tk.Event) -> None:
         self._move_dot(float(event.x), float(event.y))
@@ -252,9 +318,9 @@ class DirectControlApp:
 
     def run(self) -> None:
         print(
-            f"[direct_control] circle d={CIRCLE_DIAMETER:.0f}px  r={CIRCLE_RADIUS:.1f}px  "
-            f"edge = ±1.0000 rad (±{math.degrees(1.0):.1f}°)  "
-            f"serial {BAUD} baud  line='right_deg,up_deg'",
+            f"[direct_control] circle d={CIRCLE_DIAMETER:.0f}px  "
+            f"edges ±{MAX_TURN_X}° X / ±{MAX_TURN_Y}° Y  "
+            f"nudge={NUDGE_DEG}°  serial {BAUD} baud",
             flush=True,
         )
         self.root.mainloop()

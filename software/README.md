@@ -1,15 +1,22 @@
 # Eyemech — computer-side software
 
 Two **supported** ways to drive `firmware/firmware.ino` over USB-serial
-(9600 baud, `"right_deg,up_deg\n"`, center = `0,0`):
+(9600 baud):
 
 | Script | Role |
 |--------|------|
 | `direct_control.py` | Tkinter mouse pad → degrees → Arduino |
 | `pupil_control.py` | Webcam + MediaPipe iris → same degrees → Arduino |
+| `calibrate.py` | Same pad UI; records max L/R/U/D host degrees to `calib_limits_*.txt` |
 
-Firmware clamps with `safe_turn()` to ±`MAX_TURN_ANGLE` (15°). Four eyelid
-servos blink on a timer; X/Y follow the last serial command.
+**Protocol**
+- Gaze: `"<right_deg>,<up_deg>\n"` — `0,0` = look straight (calibrated midpoints)
+- Park: `"HOME\n"` — calibrated zero pose (sent on clean Disconnect / app exit)
+- Host angles are clamped per axis from range calibration: **±14° X**, **±4.5° Y**,
+  then mapped onto each eyeball’s calibrated min…max (X: 0–80, Y: 60–120)
+
+Firmware auto-blinks eyelids using calibrated open/closed endpoints.
+On boot it **assumes** the mechanism is already at HOME (does not drive there).
 
 ## Install
 
@@ -33,6 +40,17 @@ python direct_control.py
 
 Pick the serial port, click **Connect**, move the cursor inside the circle.
 Angles print in the terminal and stream to the board when connected.
+
+## Range calibrator
+
+```bash
+python calibrate.py
+```
+
+Arrow-only UI (no mouse pad). On start it creates `calib_limits_YYYYMMDD_HHMMSS.txt`.
+**Home** sets the current pose as zero and **resets** recorded extremes.
+Then nudge ← → ↑ ↓ to safe edges; `max_right` / `max_left` / `max_up` / `max_down`
+update whenever you beat a relative extreme. Quit and share that `.txt`.
 
 ## MediaPipe iris / pupil
 
