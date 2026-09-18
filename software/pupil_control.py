@@ -27,12 +27,13 @@ hurt. For animatronic eyes this is usually enough.
 Usage
 -----
   python pupil_control.py
-  python pupil_control.py --port /dev/ttyUSB0
-  python pupil_control.py --mock                 # print degrees to stdout
+  python pupil_control.py --port /dev/ttyUSB0   # optional auto-connect
+  python pupil_control.py --mock
   python pupil_control.py --camera 1 --invert-y
-  python pupil_control.py --image still.jpg      # single-frame smoke test
+  python pupil_control.py --image still.jpg
 
-Press 'q' to quit live mode.
+Use Port / Update / Connect in the control window (same as direct_control).
+Press 'q' in the webcam window to quit.
 """
 
 from __future__ import annotations
@@ -92,10 +93,17 @@ DEFAULT_MODEL = os.path.join(HERE, "models", "face_landmarker.task")
 
 BAUD = 9600
 SEND_INTERVAL_S = 0.02  # ~50 Hz — same idea as direct_control.py
-# Match firmware host-degree edges (from range calibrator).
+# Host-degree edges (Arduino / calibrate.py) — full servo travel.
 MAX_TURN_X = 14.0
 MAX_TURN_Y = 4.5
-NUDGE_DEG = 0.5
+NUDGE_DEG = 1.0
+
+# Iris θ extremes from eye_calibrate.py (unit-disk s/r). Full natural look
+# in each direction maps to ±MAX_TURN_*. D was 0 in the session → mirror U.
+IRIS_MAX_RIGHT = 0.3350
+IRIS_MAX_LEFT = 0.5186   # magnitude of left extreme (θ was -0.5186)
+IRIS_MAX_UP = 0.2124
+IRIS_MAX_DOWN = 0.2124   # mirrored from up (down was not recorded)
 
 
 Point = Tuple[float, float]
@@ -181,6 +189,25 @@ def average_sphere_angles(
     return sum(rs) / len(rs), sum(us) / len(us)
 
 
+def map_iris_theta_to_degrees(th_r: float, th_u: float) -> Tuple[float, float]:
+    """
+    Scale measured iris θ (unit disk) so each calibrated extreme hits the
+    full host-degree limit for that axis (asymmetric L/R and U/D).
+    """
+    if th_r >= 0.0:
+        n_r = th_r / IRIS_MAX_RIGHT if IRIS_MAX_RIGHT > 1e-6 else 0.0
+    else:
+        n_r = th_r / IRIS_MAX_LEFT if IRIS_MAX_LEFT > 1e-6 else 0.0
+    if th_u >= 0.0:
+        n_u = th_u / IRIS_MAX_UP if IRIS_MAX_UP > 1e-6 else 0.0
+    else:
+        n_u = th_u / IRIS_MAX_DOWN if IRIS_MAX_DOWN > 1e-6 else 0.0
+    # Allow slight overshoot from noisy frames, then clamp.
+    n_r = max(-1.0, min(1.0, n_r))
+    n_u = max(-1.0, min(1.0, n_u))
+    return n_r * MAX_TURN_X, n_u * MAX_TURN_Y
+
+
 def clamp_degrees(right_deg: float, up_deg: float) -> Tuple[float, float]:
     """PC-side safety clamp (firmware also clamps per axis)."""
     return (
@@ -190,10 +217,11 @@ def clamp_degrees(right_deg: float, up_deg: float) -> Tuple[float, float]:
 
 
 def format_angles(th_right: float, th_up: float) -> str:
-    """Unit-disk fractions + mapped host degrees."""
+    """Unit-disk θ + mapped host degrees."""
+    deg_r, deg_u = map_iris_theta_to_degrees(th_right, th_up)
     return (
-        f"right={th_right:+.4f} ({th_right * MAX_TURN_X:+.1f}°)  "
-        f"up={th_up:+.4f} ({th_up * MAX_TURN_Y:+.1f}°)"
+        f"θ=({th_right:+.3f},{th_up:+.3f})  "
+        f"deg=({deg_r:+.1f},{deg_u:+.1f})"
     )
 
 
@@ -210,35 +238,38 @@ def create_landmarker(model_path: str) -> mp_vision.FaceLandmarker:
 
 
 class FirmwareSender:
-    """Sends ``right_deg,up_deg\\n`` to Arduino or stdout (--mock)."""
+    """Sends ``right_deg,up_deg\\n`` to Arduino (or stdout in mock mode)."""
 
-    def __init__(
-        self,
-        port: Optional[str] = None,
-        baud: int = BAUD,
-        mock: bool = False,
-    ) -> None:
+    def __init__(self, baud: int = BAUD, mock: bool = False) -> None:
         self.mock = mock
-        self.port = port
         self.baud = baud
+        self.port: Optional[str] = None
         self._ser = None
         self._last_send_t = 0.0
         self._last_sent: Optional[Tuple[float, float]] = None
-        if mock:
-            return
-        if not port:
-            raise ValueError("port required unless mock=True")
+
+    @property
+    def connected(self) -> bool:
+        return self.mock or self._ser is not None
+
+    def connect(self, port: str) -> None:
         if serial is None:
-            raise SystemExit("pyserial missing — `uv pip install pyserial` or use --mock")
-        self._ser = serial.Serial(port, baud, timeout=0.1)
+            raise RuntimeError("pyserial missing — `uv pip install pyserial`")
+        if self._ser is not None:
+            self.disconnect(park_home=False)
+        self._ser = serial.Serial(port, self.baud, timeout=0.1)
+        self.port = port
         time.sleep(2.0)  # Arduino resets on open
         try:
             self._ser.reset_input_buffer()
         except Exception:
             pass
-        print(f"[pupil_control] serial open {port} @ {baud}", file=sys.stderr)
+        self._last_sent = None
+        print(f"[pupil_control] serial open {port} @ {self.baud}", file=sys.stderr)
 
     def send(self, right_deg: float, up_deg: float, force: bool = False) -> None:
+        if not self.connected:
+            return
         now = time.monotonic()
         if not force and (now - self._last_send_t) < SEND_INTERVAL_S:
             return
@@ -246,16 +277,17 @@ class FirmwareSender:
         if not force and sample == self._last_sent:
             return
         line = f"{sample[0]:.2f},{sample[1]:.2f}\n"
-        if self.mock or self._ser is None:
+        if self.mock:
             sys.stdout.write(line)
             sys.stdout.flush()
-        else:
+        elif self._ser is not None:
             try:
                 self._ser.write(line.encode("ascii"))
+                self._ser.flush()
             except Exception as exc:
                 print(f"[pupil_control] serial write failed: {exc}", file=sys.stderr)
-                self.close(park_home=False)
-                raise
+                self.disconnect(park_home=False)
+                return
         self._last_send_t = now
         self._last_sent = sample
 
@@ -274,8 +306,8 @@ class FirmwareSender:
         except Exception as exc:
             print(f"[pupil_control] HOME failed: {exc}", file=sys.stderr)
 
-    def close(self, park_home: bool = True) -> None:
-        if park_home:
+    def disconnect(self, park_home: bool = True) -> None:
+        if park_home and self._ser is not None:
             self.home()
         if self._ser is not None:
             try:
@@ -283,6 +315,10 @@ class FirmwareSender:
             except Exception:
                 pass
             self._ser = None
+        self.port = None
+
+    def close(self, park_home: bool = True) -> None:
+        self.disconnect(park_home=park_home)
 
 
 def list_ports() -> None:
@@ -391,7 +427,7 @@ def run_image(path: str, model_path: str, out: Optional[str]) -> int:
         )
     if info:
         th_r, th_u = average_sphere_angles(info)
-        cmd_r, cmd_u = clamp_degrees(th_r * MAX_TURN_X, th_u * MAX_TURN_Y)
+        cmd_r, cmd_u = clamp_degrees(*map_iris_theta_to_degrees(th_r, th_u))
         print(f"avg: {format_angles(th_r, th_u)}  -> send {cmd_r:+.2f},{cmd_u:+.2f}")
     else:
         print("no face / iris detected", file=sys.stderr)
@@ -402,52 +438,104 @@ def run_image(path: str, model_path: str, out: Optional[str]) -> int:
 
 
 class CalibState:
-    """Shared zero-offset for arrow nudges + Home (set zero)."""
+    """
+    Manual pose (arrows) + optional iris gaze once tracking is started.
+
+    Wire command = base + zero + gaze (then clamped).
+    Home sets base to the current pose and clears zero/gaze so the UI is
+    (0,0) without moving the eye (caller must not send a new command).
+    """
 
     def __init__(self) -> None:
+        self.base_r = 0.0
+        self.base_u = 0.0
         self.zero_r = 0.0
         self.zero_u = 0.0
         self.gaze_r = 0.0
         self.gaze_u = 0.0
+        self.tracking = False
 
     def clamp(self, r: float, u: float) -> Tuple[float, float]:
         return clamp_degrees(r, u)
 
     def nudge(self, dr: float, du: float) -> Tuple[float, float]:
+        self.gaze_r = 0.0
+        self.gaze_u = 0.0
         self.zero_r, self.zero_u = self.clamp(self.zero_r + dr, self.zero_u + du)
         return self.command()
 
     def set_home_zero(self) -> Tuple[float, float]:
-        abs_r = self.zero_r + self.gaze_r
-        abs_u = self.zero_u + self.gaze_u
-        self.zero_r, self.zero_u = self.clamp(abs_r, abs_u)
+        """Regard current pose as home; coordinates become (0,0); no motion."""
+        self.base_r, self.base_u = self.command()
+        self.zero_r = 0.0
+        self.zero_u = 0.0
         self.gaze_r = 0.0
         self.gaze_u = 0.0
         return self.command()
 
     def set_gaze(self, right_deg: float, up_deg: float) -> Tuple[float, float]:
+        if not self.tracking:
+            return self.command()
         self.gaze_r, self.gaze_u = self.clamp(right_deg, up_deg)
         return self.command()
 
     def command(self) -> Tuple[float, float]:
-        return self.clamp(self.zero_r + self.gaze_r, self.zero_u + self.gaze_u)
+        return self.clamp(
+            self.base_r + self.zero_r + self.gaze_r,
+            self.base_u + self.zero_u + self.gaze_u,
+        )
 
 
-class CalibPanel:
-    """Small always-on-top tk bar: ← → ↑ ↓ and Home (set zero)."""
+class ControlPanel:
+    """Tk control strip: Port / Update / Connect + calib arrows + Home."""
 
-    def __init__(self, calib: CalibState, on_change) -> None:
+    def __init__(
+        self,
+        calib: CalibState,
+        sender: FirmwareSender,
+        initial_port: Optional[str] = None,
+    ) -> None:
         if tk is None:
-            raise SystemExit("tkinter required for calib buttons (sudo apt install python3-tk)")
+            raise SystemExit(
+                "tkinter required for the control panel (sudo apt install python3-tk)"
+            )
         self.calib = calib
-        self.on_change = on_change
+        self.sender = sender
         self.root = tk.Tk()
-        self.root.title("Eyemech calib")
+        self.root.title("Eyemech pupil control")
         self.root.resizable(False, False)
         self.root.attributes("-topmost", True)
 
-        bar = ttk.Frame(self.root, padding=8)
-        bar.pack()
+        # --- serial chrome (same idea as direct_control) ---
+        top = ttk.Frame(self.root, padding=(8, 6))
+        top.pack(fill=tk.X)
+
+        ttk.Label(top, text="Port:").pack(side=tk.LEFT)
+        self.port_var = tk.StringVar()
+        self.port_box = ttk.Combobox(
+            top, textvariable=self.port_var, width=16, state="readonly"
+        )
+        self.port_box.pack(side=tk.LEFT, padx=(4, 6))
+
+        ttk.Button(top, text="Update", command=self._refresh_ports).pack(
+            side=tk.LEFT, padx=(0, 6)
+        )
+        self.connect_btn = ttk.Button(
+            top, text="Connect", command=self._toggle_connect
+        )
+        self.connect_btn.pack(side=tk.LEFT, padx=(0, 6))
+
+        self.start_btn = ttk.Button(
+            top, text="Start", command=self._toggle_tracking
+        )
+        self.start_btn.pack(side=tk.LEFT, padx=(0, 8))
+
+        self.status_var = tk.StringVar(value="Not Connected | arrows only")
+        ttk.Label(top, textvariable=self.status_var).pack(side=tk.LEFT)
+
+        # --- calib nudges ---
+        bar = ttk.Frame(self.root, padding=(8, 4))
+        bar.pack(fill=tk.X)
         ttk.Label(bar, text="Calib:").pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(bar, text="←", width=3, command=lambda: self._nudge(-NUDGE_DEG, 0)).pack(
             side=tk.LEFT, padx=1
@@ -464,28 +552,127 @@ class CalibPanel:
         ttk.Button(bar, text="Home", command=self._home).pack(side=tk.LEFT, padx=(8, 4))
         self.zero_var = tk.StringVar(value="zero=(+0.0,+0.0)°")
         ttk.Label(bar, textvariable=self.zero_var).pack(side=tk.LEFT)
-        self._refresh()
 
-    def _refresh(self) -> None:
-        self.zero_var.set(f"zero=({self.calib.zero_r:+.1f},{self.calib.zero_u:+.1f})°")
+        self._refresh_ports()
+        if initial_port:
+            self.port_var.set(initial_port)
+        elif self.sender.mock:
+            self.status_var.set("Mock (stdout)")
+            self.connect_btn.configure(state=tk.DISABLED)
+
+        self._refresh_zero()
+
+        # Keyboard arrows (same as buttons) — focus this window first.
+        self.root.bind("<Left>", lambda e: self._nudge(-NUDGE_DEG, 0))
+        self.root.bind("<Right>", lambda e: self._nudge(+NUDGE_DEG, 0))
+        self.root.bind("<Up>", lambda e: self._nudge(0, +NUDGE_DEG))
+        self.root.bind("<Down>", lambda e: self._nudge(0, -NUDGE_DEG))
+        self.root.focus_force()
+
+    def _refresh_ports(self) -> None:
+        ports = []
+        if comports is not None:
+            ports = [p.device for p in comports()]
+        self.port_box["values"] = ports
+        cur = self.port_var.get()
+        if ports and cur not in ports:
+            self.port_var.set(ports[0])
+        elif not ports and not self.sender.mock:
+            self.port_var.set("")
+
+    def _status_text(self) -> str:
+        link = "Connected" if self.sender.connected else "Not Connected"
+        mode = "TRACKING" if self.calib.tracking else "arrows only"
+        return f"{link} | {mode}"
+
+    def _refresh_status(self) -> None:
+        self.status_var.set(self._status_text())
+        self.start_btn.configure(
+            text="Stop" if self.calib.tracking else "Start"
+        )
+
+    def _toggle_tracking(self) -> None:
+        self.calib.tracking = not self.calib.tracking
+        if self.calib.tracking:
+            print(
+                "[pupil_control] Start — iris tracking drives the eye",
+                file=sys.stderr,
+            )
+        else:
+            # Freeze on current zero; clear live gaze so arrows stay clean.
+            self.calib.gaze_r = 0.0
+            self.calib.gaze_u = 0.0
+            print(
+                "[pupil_control] Stop — arrows only (webcam does not drive)",
+                file=sys.stderr,
+            )
+            if self.sender.connected:
+                cmd = self.calib.command()
+                self.sender.send(cmd[0], cmd[1], force=True)
+        self._refresh_status()
+
+    def _toggle_connect(self) -> None:
+        if self.sender.mock:
+            return
+        if self.sender.connected:
+            self.sender.disconnect(park_home=True)
+            self.calib.tracking = False
+            self.connect_btn.configure(text="Connect")
+            self._refresh_status()
+            print("[pupil_control] disconnected", file=sys.stderr)
+            return
+
+        port = self.port_var.get()
+        if not port:
+            self.status_var.set("No Port")
+            return
+        self.status_var.set("Connecting…")
+        self.root.update_idletasks()
+        try:
+            self.sender.connect(port)
+        except Exception as exc:
+            self.status_var.set("Open failed")
+            print(f"[pupil_control] serial open failed: {exc}", file=sys.stderr)
+            return
+
+        self.connect_btn.configure(text="Disconnect")
+        self.calib.tracking = False  # arrows-only until Start
+        self._refresh_status()
+        cmd = self.calib.command()
+        self.sender.send(cmd[0], cmd[1], force=True)
+        print(
+            "[pupil_control] connected — use arrows now; click Start for iris follow",
+            file=sys.stderr,
+        )
+
+    def _refresh_zero(self) -> None:
+        self.zero_var.set(
+            f"rel=({self.calib.zero_r:+.1f},{self.calib.zero_u:+.1f})°  "
+            f"base=({self.calib.base_r:+.1f},{self.calib.base_u:+.1f})°"
+        )
 
     def _nudge(self, dr: float, du: float) -> None:
+        if not self.sender.connected:
+            self.status_var.set("Connect first!")
+            print("[calib] nudge ignored — not connected", file=sys.stderr)
+            return
         cmd = self.calib.nudge(dr, du)
-        self._refresh()
-        print(
-            f"[calib] nudge → zero=({self.calib.zero_r:+.2f},{self.calib.zero_u:+.2f})°",
-            flush=True,
-        )
-        self.on_change(cmd, force=True)
+        self._refresh_zero()
+        print(f"[calib] nudge → cmd=({cmd[0]:+.2f},{cmd[1]:+.2f})°", flush=True)
+        self.sender.send(cmd[0], cmd[1], force=True)
 
     def _home(self) -> None:
-        cmd = self.calib.set_home_zero()
-        self._refresh()
+        # Redefine origin only — do not send (eye must not move).
+        before = self.calib.command()
+        after = self.calib.set_home_zero()
+        self._refresh_zero()
         print(
-            f"[calib] Home → set zero=({self.calib.zero_r:+.2f},{self.calib.zero_u:+.2f})°",
+            f"[calib] Home — pose unchanged "
+            f"({before[0]:+.2f},{before[1]:+.2f}) → coords (0,0) "
+            f"[base=({self.calib.base_r:+.2f},{self.calib.base_u:+.2f})]",
             flush=True,
         )
-        self.on_change(cmd, force=True)
+        assert abs(before[0] - after[0]) < 1e-6 and abs(before[1] - after[1]) < 1e-6
 
     def pump(self) -> None:
         try:
@@ -503,25 +690,26 @@ class CalibPanel:
 
 def run_camera(args: argparse.Namespace) -> int:
     model_path = ensure_model(args.model)
-    sender: Optional[FirmwareSender] = None
-    if args.mock:
-        sender = FirmwareSender(mock=True)
-    elif args.port:
-        sender = FirmwareSender(port=args.port, baud=args.baud, mock=False)
-
+    sender = FirmwareSender(baud=args.baud, mock=bool(args.mock))
     calib = CalibState()
 
-    def on_calib_change(cmd: Tuple[float, float], force: bool = False) -> None:
-        if sender is not None:
-            sender.send(cmd[0], cmd[1], force=force)
-
-    panel: Optional[CalibPanel] = None
+    panel: Optional[ControlPanel] = None
     try:
-        panel = CalibPanel(calib, on_calib_change)
+        panel = ControlPanel(calib, sender, initial_port=args.port)
     except SystemExit as e:
         print(e, file=sys.stderr)
-        # Continue without buttons if tk missing
         panel = None
+
+    # Optional auto-connect from CLI --port (panel Connect still works either way).
+    if args.port and not args.mock and panel is not None:
+        panel.port_var.set(args.port)
+        try:
+            sender.connect(args.port)
+            panel.connect_btn.configure(text="Disconnect")
+            panel.calib.tracking = False
+            panel._refresh_status()
+        except Exception as exc:
+            print(f"[pupil_control] auto-connect failed: {exc}", file=sys.stderr)
 
     cap = cv2.VideoCapture(args.camera)
     if not cap.isOpened():
@@ -534,10 +722,11 @@ def run_camera(args: argparse.Namespace) -> int:
     if args.height > 0:
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
 
-    mode = "mock" if args.mock else (args.port or "preview-only")
     print(
-        f"[pupil_control] camera={args.camera} serial={mode} "
-        f"edges ±{MAX_TURN_X}° X / ±{MAX_TURN_Y}° Y  nudge={NUDGE_DEG}° — press 'q' to quit",
+        f"[pupil_control] camera={args.camera}  "
+        f"iris θ→deg (R{IRIS_MAX_RIGHT}/L{IRIS_MAX_LEFT}/U{IRIS_MAX_UP}/D{IRIS_MAX_DOWN}) "
+        f"→ ±{MAX_TURN_X}°/±{MAX_TURN_Y}° — "
+        f"Connect → arrows; Start → iris follow; 'q' quits",
         file=sys.stderr,
     )
 
@@ -559,50 +748,65 @@ def run_camera(args: argparse.Namespace) -> int:
                 ts = int((time.time() - t0) * 1000)
                 annotated, info = process_frame(landmarker, frame, ts)
 
+                cmd_r, cmd_u = calib.command()
+                th_r = th_u = 0.0
+
                 if info:
                     no_face = 0
                     th_r, th_u = average_sphere_angles(
                         info, gain=args.gain, invert_y=args.invert_y
                     )
-                    # Unit-disk iris offset → calibrated host degrees.
-                    right_deg = th_r * MAX_TURN_X
-                    up_deg = th_u * MAX_TURN_Y
+                    right_deg, up_deg = map_iris_theta_to_degrees(th_r, th_u)
+                    # Only updates gaze when tracking==True (after Start).
                     cmd_r, cmd_u = calib.set_gaze(right_deg, up_deg)
-
-                    now = time.monotonic()
-                    if (now - last_print_t) >= SEND_INTERVAL_S:
-                        print(
-                            f"{format_angles(th_r, th_u)}  "
-                            f"zero=({calib.zero_r:+.1f},{calib.zero_u:+.1f})",
-                            flush=True,
-                        )
-                        last_print_t = now
-
-                    cv2.putText(
-                        annotated,
-                        format_angles(th_r, th_u),
-                        (10, 56),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.55,
-                        (0, 255, 255),
-                        2,
-                    )
-                    cv2.putText(
-                        annotated,
-                        f"send {cmd_r:+.1f},{cmd_u:+.1f}  zero=({calib.zero_r:+.1f},{calib.zero_u:+.1f})",
-                        (10, 84),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.55,
-                        (255, 200, 0),
-                        2,
-                    )
-                    if sender is not None:
-                        sender.send(cmd_r, cmd_u)
                 else:
                     no_face += 1
-                    if sender is not None and no_face > args.lose_timeout:
-                        cmd = calib.set_gaze(0.0, 0.0)
-                        sender.send(cmd[0], cmd[1])
+                    if (
+                        calib.tracking
+                        and sender.connected
+                        and no_face > args.lose_timeout
+                    ):
+                        cmd_r, cmd_u = calib.set_gaze(0.0, 0.0)
+
+                now = time.monotonic()
+                if (now - last_print_t) >= SEND_INTERVAL_S:
+                    link = "TX" if sender.connected else "no-serial"
+                    mode = "TRACK" if calib.tracking else "ARROWS"
+                    print(
+                        f"{format_angles(th_r, th_u)}  "
+                        f"cmd=({cmd_r:+.1f},{cmd_u:+.1f})  [{link}/{mode}]",
+                        flush=True,
+                    )
+                    last_print_t = now
+
+                cv2.putText(
+                    annotated,
+                    format_angles(th_r, th_u),
+                    (10, 56),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (0, 255, 255),
+                    2,
+                )
+                if sender.connected:
+                    mode = "TRACKING" if calib.tracking else "ARROWS ONLY"
+                    color = (0, 255, 0) if calib.tracking else (255, 200, 0)
+                else:
+                    mode = "Not Connected"
+                    color = (0, 0, 255)
+                cv2.putText(
+                    annotated,
+                    f"send {cmd_r:+.1f},{cmd_u:+.1f}  {mode}",
+                    (10, 84),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    color,
+                    2,
+                )
+
+                # Iris serial only after Start; arrows always send via button handlers.
+                if sender.connected and calib.tracking:
+                    sender.send(cmd_r, cmd_u)
 
                 cv2.imshow(win, annotated)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
@@ -612,8 +816,7 @@ def run_camera(args: argparse.Namespace) -> int:
             cv2.destroyAllWindows()
             if panel is not None:
                 panel.destroy()
-            if sender is not None:
-                sender.close(park_home=True)
+            sender.close(park_home=True)
     return 0
 
 
@@ -665,11 +868,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
     if args.image:
         return run_image(args.image, args.model, args.out)
-    if not args.mock and not args.port:
-        print(
-            "[pupil_control] no --port; preview only (use --port or --mock to drive firmware)",
-            file=sys.stderr,
-        )
     return run_camera(args)
 
 

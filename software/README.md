@@ -7,13 +7,16 @@ Two **supported** ways to drive `firmware/firmware.ino` over USB-serial
 |--------|------|
 | `direct_control.py` | Tkinter mouse pad → degrees → Arduino |
 | `pupil_control.py` | Webcam + MediaPipe iris → same degrees → Arduino |
-| `calibrate.py` | Same pad UI; records max L/R/U/D host degrees to `calib_limits_*.txt` |
+| `calibrate.py` | Arrow-only; records max L/R/U/D **host degrees** (Arduino) |
+| `eye_calibrate.py` | Webcam only; records max iris **θ = s/r** (unit disk) |
 
 **Protocol**
 - Gaze: `"<right_deg>,<up_deg>\n"` — `0,0` = look straight (calibrated midpoints)
 - Park: `"HOME\n"` — calibrated zero pose (sent on clean Disconnect / app exit)
-- Host angles are clamped per axis from range calibration: **±14° X**, **±4.5° Y**,
+- Host angles are clamped per axis from mechanism calibration: **±14° X**, **±4.5° Y**,
   then mapped onto each eyeball’s calibrated min…max (X: 0–80, Y: 60–120)
+- `pupil_control.py` scales iris θ by measured extremes (see `eye_calib_limits.txt`:
+  R≈0.34, L≈0.52, U≈0.21) so a full natural look hits those host limits
 
 Firmware auto-blinks eyelids using calibrated open/closed endpoints.
 On boot it **assumes** the mechanism is already at HOME (does not drive there).
@@ -52,6 +55,16 @@ Arrow-only UI (no mouse pad). On start it creates `calib_limits_YYYYMMDD_HHMMSS.
 Then nudge ← → ↑ ↓ to safe edges; `max_right` / `max_left` / `max_up` / `max_down`
 update whenever you beat a relative extreme. Quit and share that `.txt`.
 
+## Iris range calibrator (no Arduino)
+
+```bash
+python eye_calibrate.py
+```
+
+Webcam + MediaPipe only. Look hard left/right/up/down; peaks of unit-disk
+`θ = s/r` are written to `eye_calib_limits_*.txt`. Share that file so we can
+scale `pupil_control` mapping to your real iris travel.
+
 ## MediaPipe iris / pupil
 
 Tracks iris center inside each eye (reliable realtime proxy for “pupil”),
@@ -61,11 +74,9 @@ are averaged, printed to the terminal (rad + deg), then clamped to
 ±`--max-turn` and sent to the Arduino.
 
 ```bash
-# Preview only (no Arduino)
+# Preview / drive — Connect from the control window
 python pupil_control.py
-
-# Drive firmware
-python pupil_control.py --port /dev/ttyUSB0
+python pupil_control.py --port /dev/ttyUSB0   # optional auto-connect
 python pupil_control.py --port COM5 --invert-y
 
 # Print protocol lines instead of serial

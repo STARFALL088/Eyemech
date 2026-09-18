@@ -13,6 +13,7 @@ software/models/*.task
 # Generated / local artifacts
 software/test_face_pupil.jpg
 software/calib_limits_*.txt
+software/eye_calib_limits_*.txt
 *.pyc
 .DS_Store
 Thumbs.db

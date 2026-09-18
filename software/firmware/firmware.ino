@@ -20,7 +20,8 @@
 #include <Servo.h>
 
 // ---------------------------------------------------------------------------
-// Tunables — host-degree limits from range calibrator (pad edge = these)
+// Tunables — host-degree limits from mechanism calibrator (pad / full iris look)
+// Iris θ→deg scaling lives in pupil_control.py (eye_calibrate extremes).
 // ---------------------------------------------------------------------------
 const float MAX_TURN_X = 14.0;   // ±right  (L/R extremes)
 const float MAX_TURN_Y = 4.5;    // ±up     (U/D extremes)
