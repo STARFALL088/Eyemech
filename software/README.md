@@ -72,17 +72,3 @@ python pupil_control.py --image test_face.jpg
 
 Flash [`firmware/firmware.ino`](firmware/firmware.ino). Named pins D2–D7
 (X, Y, four blink lids). See root [`README.md`](../README.md) for the table.
-
-## Legacy / experimental
-
-These remain in the tree but are **not** the preferred path for the new firmware:
-
-| File | Notes |
-|------|--------|
-| `eyemech_gaze.py` | OpenCV Haar face/pupil → old `0..1023` protocol for `Basic movements for openCV.ino` (PCA9685) |
-| `eye_track_basic.py` | Minimal Haar + blob pupil demo |
-| `gaze_analysis.py` | Offline fixation / dyslexia-style metrics (no camera) |
-| `verify_firmware_compat.py` | Checks old Python↔PCA9685 mapping |
-
-Haar/blob live tracking is fragile; prefer `pupil_control.py` (MediaPipe) or
-`direct_control.py` (mouse).
