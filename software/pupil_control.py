@@ -15,8 +15,8 @@ with the same protocol as the mouse pad:
 
   "<right_deg>,<up_deg>\\n"   @ 9600 baud
 
-Firmware (``firmware/firmware.ino``) clamps with ``safe_turn()`` to
-±MAX_TURN_ANGLE (15° by default).
+Firmware (``firmware/firmware.ino``) clamps per axis
+(±14° X, ±4.5° Y from range calibrator).
 
 Honest note on reliability
 --------------------------
@@ -47,6 +47,13 @@ from typing import List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
+
+try:
+    import tkinter as tk
+    from tkinter import ttk
+except ImportError:  # pragma: no cover
+    tk = None  # type: ignore
+    ttk = None  # type: ignore
 
 try:
     import mediapipe as mp
@@ -85,8 +92,10 @@ DEFAULT_MODEL = os.path.join(HERE, "models", "face_landmarker.task")
 
 BAUD = 9600
 SEND_INTERVAL_S = 0.02  # ~50 Hz — same idea as direct_control.py
-# Match firmware MAX_TURN_ANGLE; pad/iris full deflection maps to this.
-DEFAULT_MAX_TURN_ANGLE = 15.0
+# Match firmware host-degree edges (from range calibrator).
+MAX_TURN_X = 14.0
+MAX_TURN_Y = 4.5
+NUDGE_DEG = 0.5
 
 
 Point = Tuple[float, float]
@@ -172,19 +181,19 @@ def average_sphere_angles(
     return sum(rs) / len(rs), sum(us) / len(us)
 
 
-def clamp_degrees(right_deg: float, up_deg: float, max_turn: float) -> Tuple[float, float]:
-    """PC-side safety clamp (firmware also runs safe_turn)."""
+def clamp_degrees(right_deg: float, up_deg: float) -> Tuple[float, float]:
+    """PC-side safety clamp (firmware also clamps per axis)."""
     return (
-        max(-max_turn, min(max_turn, right_deg)),
-        max(-max_turn, min(max_turn, up_deg)),
+        max(-MAX_TURN_X, min(MAX_TURN_X, right_deg)),
+        max(-MAX_TURN_Y, min(MAX_TURN_Y, up_deg)),
     )
 
 
 def format_angles(th_right: float, th_up: float) -> str:
-    """Match direct_control.py terminal line."""
+    """Unit-disk fractions + mapped host degrees."""
     return (
-        f"right={th_right:+.4f} rad ({math.degrees(th_right):+.1f}°)  "
-        f"up={th_up:+.4f} rad ({math.degrees(th_up):+.1f}°)"
+        f"right={th_right:+.4f} ({th_right * MAX_TURN_X:+.1f}°)  "
+        f"up={th_up:+.4f} ({th_up * MAX_TURN_Y:+.1f}°)"
     )
 
 
@@ -245,12 +254,29 @@ class FirmwareSender:
                 self._ser.write(line.encode("ascii"))
             except Exception as exc:
                 print(f"[pupil_control] serial write failed: {exc}", file=sys.stderr)
-                self.close()
+                self.close(park_home=False)
                 raise
         self._last_send_t = now
         self._last_sent = sample
 
-    def close(self) -> None:
+    def home(self) -> None:
+        """Park mechanism at calibrated zero before a clean shutdown."""
+        if self.mock:
+            sys.stdout.write("HOME\n")
+            sys.stdout.flush()
+            return
+        if self._ser is None:
+            return
+        try:
+            self._ser.write(b"HOME\n")
+            self._ser.flush()
+            time.sleep(0.4)
+        except Exception as exc:
+            print(f"[pupil_control] HOME failed: {exc}", file=sys.stderr)
+
+    def close(self, park_home: bool = True) -> None:
+        if park_home:
+            self.home()
         if self._ser is not None:
             try:
                 self._ser.close()
@@ -365,9 +391,7 @@ def run_image(path: str, model_path: str, out: Optional[str]) -> int:
         )
     if info:
         th_r, th_u = average_sphere_angles(info)
-        cmd_r, cmd_u = clamp_degrees(
-            math.degrees(th_r), math.degrees(th_u), DEFAULT_MAX_TURN_ANGLE
-        )
+        cmd_r, cmd_u = clamp_degrees(th_r * MAX_TURN_X, th_u * MAX_TURN_Y)
         print(f"avg: {format_angles(th_r, th_u)}  -> send {cmd_r:+.2f},{cmd_u:+.2f}")
     else:
         print("no face / iris detected", file=sys.stderr)
@@ -375,6 +399,106 @@ def run_image(path: str, model_path: str, out: Optional[str]) -> int:
     cv2.imwrite(dest, annotated)
     print(f"saved -> {dest}")
     return 0 if info else 2
+
+
+class CalibState:
+    """Shared zero-offset for arrow nudges + Home (set zero)."""
+
+    def __init__(self) -> None:
+        self.zero_r = 0.0
+        self.zero_u = 0.0
+        self.gaze_r = 0.0
+        self.gaze_u = 0.0
+
+    def clamp(self, r: float, u: float) -> Tuple[float, float]:
+        return clamp_degrees(r, u)
+
+    def nudge(self, dr: float, du: float) -> Tuple[float, float]:
+        self.zero_r, self.zero_u = self.clamp(self.zero_r + dr, self.zero_u + du)
+        return self.command()
+
+    def set_home_zero(self) -> Tuple[float, float]:
+        abs_r = self.zero_r + self.gaze_r
+        abs_u = self.zero_u + self.gaze_u
+        self.zero_r, self.zero_u = self.clamp(abs_r, abs_u)
+        self.gaze_r = 0.0
+        self.gaze_u = 0.0
+        return self.command()
+
+    def set_gaze(self, right_deg: float, up_deg: float) -> Tuple[float, float]:
+        self.gaze_r, self.gaze_u = self.clamp(right_deg, up_deg)
+        return self.command()
+
+    def command(self) -> Tuple[float, float]:
+        return self.clamp(self.zero_r + self.gaze_r, self.zero_u + self.gaze_u)
+
+
+class CalibPanel:
+    """Small always-on-top tk bar: ← → ↑ ↓ and Home (set zero)."""
+
+    def __init__(self, calib: CalibState, on_change) -> None:
+        if tk is None:
+            raise SystemExit("tkinter required for calib buttons (sudo apt install python3-tk)")
+        self.calib = calib
+        self.on_change = on_change
+        self.root = tk.Tk()
+        self.root.title("Eyemech calib")
+        self.root.resizable(False, False)
+        self.root.attributes("-topmost", True)
+
+        bar = ttk.Frame(self.root, padding=8)
+        bar.pack()
+        ttk.Label(bar, text="Calib:").pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(bar, text="←", width=3, command=lambda: self._nudge(-NUDGE_DEG, 0)).pack(
+            side=tk.LEFT, padx=1
+        )
+        ttk.Button(bar, text="→", width=3, command=lambda: self._nudge(+NUDGE_DEG, 0)).pack(
+            side=tk.LEFT, padx=1
+        )
+        ttk.Button(bar, text="↑", width=3, command=lambda: self._nudge(0, +NUDGE_DEG)).pack(
+            side=tk.LEFT, padx=1
+        )
+        ttk.Button(bar, text="↓", width=3, command=lambda: self._nudge(0, -NUDGE_DEG)).pack(
+            side=tk.LEFT, padx=1
+        )
+        ttk.Button(bar, text="Home", command=self._home).pack(side=tk.LEFT, padx=(8, 4))
+        self.zero_var = tk.StringVar(value="zero=(+0.0,+0.0)°")
+        ttk.Label(bar, textvariable=self.zero_var).pack(side=tk.LEFT)
+        self._refresh()
+
+    def _refresh(self) -> None:
+        self.zero_var.set(f"zero=({self.calib.zero_r:+.1f},{self.calib.zero_u:+.1f})°")
+
+    def _nudge(self, dr: float, du: float) -> None:
+        cmd = self.calib.nudge(dr, du)
+        self._refresh()
+        print(
+            f"[calib] nudge → zero=({self.calib.zero_r:+.2f},{self.calib.zero_u:+.2f})°",
+            flush=True,
+        )
+        self.on_change(cmd, force=True)
+
+    def _home(self) -> None:
+        cmd = self.calib.set_home_zero()
+        self._refresh()
+        print(
+            f"[calib] Home → set zero=({self.calib.zero_r:+.2f},{self.calib.zero_u:+.2f})°",
+            flush=True,
+        )
+        self.on_change(cmd, force=True)
+
+    def pump(self) -> None:
+        try:
+            self.root.update_idletasks()
+            self.root.update()
+        except tk.TclError:
+            pass
+
+    def destroy(self) -> None:
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
 
 
 def run_camera(args: argparse.Namespace) -> int:
@@ -385,9 +509,25 @@ def run_camera(args: argparse.Namespace) -> int:
     elif args.port:
         sender = FirmwareSender(port=args.port, baud=args.baud, mock=False)
 
+    calib = CalibState()
+
+    def on_calib_change(cmd: Tuple[float, float], force: bool = False) -> None:
+        if sender is not None:
+            sender.send(cmd[0], cmd[1], force=force)
+
+    panel: Optional[CalibPanel] = None
+    try:
+        panel = CalibPanel(calib, on_calib_change)
+    except SystemExit as e:
+        print(e, file=sys.stderr)
+        # Continue without buttons if tk missing
+        panel = None
+
     cap = cv2.VideoCapture(args.camera)
     if not cap.isOpened():
         print(f"Cannot open camera {args.camera}", file=sys.stderr)
+        if panel:
+            panel.destroy()
         return 1
     if args.width > 0:
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
@@ -397,12 +537,11 @@ def run_camera(args: argparse.Namespace) -> int:
     mode = "mock" if args.mock else (args.port or "preview-only")
     print(
         f"[pupil_control] camera={args.camera} serial={mode} "
-        f"max_turn=±{args.max_turn}°  (theta = s/r, eye circle) — press 'q' to quit",
+        f"edges ±{MAX_TURN_X}° X / ±{MAX_TURN_Y}° Y  nudge={NUDGE_DEG}° — press 'q' to quit",
         file=sys.stderr,
     )
 
     win = "Eyemech pupil_control"
-    # Hide Qt HighGUI toolbar (pan / zoom / properties / status).
     cv2.namedWindow(win, cv2.WINDOW_AUTOSIZE | cv2.WINDOW_GUI_NORMAL)
 
     t0 = time.time()
@@ -411,6 +550,9 @@ def run_camera(args: argparse.Namespace) -> int:
     with create_landmarker(model_path) as landmarker:
         try:
             while True:
+                if panel is not None:
+                    panel.pump()
+
                 ok, frame = cap.read()
                 if not ok:
                     continue
@@ -422,13 +564,18 @@ def run_camera(args: argparse.Namespace) -> int:
                     th_r, th_u = average_sphere_angles(
                         info, gain=args.gain, invert_y=args.invert_y
                     )
-                    right_deg = math.degrees(th_r)
-                    up_deg = math.degrees(th_u)
-                    cmd_r, cmd_u = clamp_degrees(right_deg, up_deg, args.max_turn)
+                    # Unit-disk iris offset → calibrated host degrees.
+                    right_deg = th_r * MAX_TURN_X
+                    up_deg = th_u * MAX_TURN_Y
+                    cmd_r, cmd_u = calib.set_gaze(right_deg, up_deg)
 
                     now = time.monotonic()
                     if (now - last_print_t) >= SEND_INTERVAL_S:
-                        print(format_angles(th_r, th_u), flush=True)
+                        print(
+                            f"{format_angles(th_r, th_u)}  "
+                            f"zero=({calib.zero_r:+.1f},{calib.zero_u:+.1f})",
+                            flush=True,
+                        )
                         last_print_t = now
 
                     cv2.putText(
@@ -442,10 +589,10 @@ def run_camera(args: argparse.Namespace) -> int:
                     )
                     cv2.putText(
                         annotated,
-                        f"send {cmd_r:+.1f},{cmd_u:+.1f} deg",
+                        f"send {cmd_r:+.1f},{cmd_u:+.1f}  zero=({calib.zero_r:+.1f},{calib.zero_u:+.1f})",
                         (10, 84),
                         cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6,
+                        0.55,
                         (255, 200, 0),
                         2,
                     )
@@ -454,7 +601,8 @@ def run_camera(args: argparse.Namespace) -> int:
                 else:
                     no_face += 1
                     if sender is not None and no_face > args.lose_timeout:
-                        sender.send(0.0, 0.0)
+                        cmd = calib.set_gaze(0.0, 0.0)
+                        sender.send(cmd[0], cmd[1])
 
                 cv2.imshow(win, annotated)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
@@ -462,12 +610,10 @@ def run_camera(args: argparse.Namespace) -> int:
         finally:
             cap.release()
             cv2.destroyAllWindows()
+            if panel is not None:
+                panel.destroy()
             if sender is not None:
-                try:
-                    sender.send(0.0, 0.0, force=True)
-                except Exception:
-                    pass
-                sender.close()
+                sender.close(park_home=True)
     return 0
 
 
@@ -495,12 +641,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--mock",
         action="store_true",
         help="Print right_deg,up_deg lines to stdout instead of serial.",
-    )
-    p.add_argument(
-        "--max-turn",
-        type=float,
-        default=DEFAULT_MAX_TURN_ANGLE,
-        help="Degrees at full iris offset (match firmware MAX_TURN_ANGLE).",
     )
     p.add_argument("--gain", type=float, default=1.0, help="Amplify iris offsets.")
     p.add_argument(
