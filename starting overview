@@ -1,8 +1,12 @@
 Eyemech/
 │
-├── firmware/          # Embedded/control code
-│   ├── src/
-│   ├── include/
+├── software/          # PC control apps + Arduino firmware
+│   ├── direct_control.py   # Tkinter mouse-pad → serial degrees
+│   ├── pupil_control.py    # MediaPipe iris/webcam → serial degrees
+│   ├── firmware/
+│   │   └── firmware.ino    # 6-servo Arduino (X/Y + blink)
+│   ├── models/             # MediaPipe face_landmarker.task (auto-download)
+│   ├── requirements.txt
 │   └── README.md
 │
 ├── hardware/          # Circuit diagrams and hardware documentation

@@ -7,3 +7,4 @@
 opencv-python-headless>=4.7,<5   # camera/cascade detection (headless: no GUI window)
 numpy>=1.21                 # array math used by the trackers
 pyserial>=3.5               # USB-serial bridge to the Arduino (not needed for --mock)
+mediapipe>=0.10             # Face Landmarker iris/eye overlay (pupil_control.py)

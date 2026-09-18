@@ -1,54 +1,60 @@
-# EyeMech 👁️🤖
+# EyeMech
 
-**EyeMech** is an open-source, animatronic eye mechanism designed for robotics, wearable tech, and interactive art installations. It features multi-axis movement (pan, tilt, and realistic eyelid blinking/tracking) driven by micro servos and microcontrollers.
+**EyeMech** is an open-source animatronic eye: pan/tilt eyeball servos plus
+eyelid blink servos, driven from a PC over USB-serial.
 
----
+## Control modes (current)
 
-## 📌 Features
+| Mode | Script | Input |
+|------|--------|--------|
+| Mouse pad | `software/direct_control.py` | Tkinter circle pad → degrees over serial |
+| Iris / pupil | `software/pupil_control.py` | Webcam + MediaPipe iris → same serial protocol |
+| Legacy OpenCV | `software/eyemech_gaze.py` | Haar face/pupil → old `0..1023` protocol (PCA9685 sketch) |
 
-- **2-DOF Eyeball Movement:** Independent Pitch (up/down) and Yaw (left/right) tracking.
-- **Synchronized Eyelid Blinking:** Dual-eyelid linkages capable of realistic blinks and squinting.
-- **Modular Hardware:** Optimized for standard FDM 3D printers with zero support requirements on key linkages.
-- **Multiple Control Modes:**
-  - Joystick / Potentiometer manual override
-  - Automated saccade & blink simulation routines
-  - Vision-based face tracking (via OpenCV / Serial bridge)
+Preferred firmware for the first two modes: **`software/firmware/firmware.ino`**.
 
----
+## Protocol (new firmware)
 
-## 🛠️ Hardware Requirements
+- Baud: **9600**
+- Line: `"<right_deg>,<up_deg>\n"` (ASCII), center look = `0,0`
+- Firmware clamps each axis with `safe_turn()` to **±MAX_TURN_ANGLE** (15° default)
 
-| Component | Specification | Quantity |
-| :--- | :--- | :--- |
-| **Micro Servos** | SG90 / MG90S (Metal gear recommended) | 4–6 |
-| **Microcontroller** | Arduino Nano / ESP32 / Raspberry Pi Pico | 1 |
-| **Linkages & Hardware** | M2 / M3 Screws, Ball-joint linkages | 1 Set |
-| **Power Supply** | External 5V 2A–3A DC Power Supply | 1 |
-| **Structure** | 3D Printed Chassis (PLA or PETG) | 1 Set |
+## Hardware (new firmware pins)
 
----
+> Do not power servos from the MCU 5V pin. Use a dedicated 5V supply and common GND.
 
-## 🔌 Wiring & Pinout
+| Name | Pin | Function |
+|------|-----|----------|
+| `PIN_SERVO_X` | D2 | Horizontal (rightward +) |
+| `PIN_SERVO_Y` | D3 | Vertical (upward +) |
+| `PIN_BLINK_UL` | D4 | Upper-left eyelid |
+| `PIN_BLINK_LL` | D5 | Lower-left eyelid |
+| `PIN_BLINK_UR` | D6 | Upper-right eyelid |
+| `PIN_BLINK_LR` | D7 | Lower-right eyelid |
 
-> ⚠️ **Important:** Do not power servos directly from the microcontroller 5V pin. Use a dedicated 5V power supply and share a common Ground (GND).
+## Quick start
 
-| Servo Channel | Function | Default Pin (Arduino) |
-| :--- | :--- | :--- |
-| **Servo 1** | Horizontal Pan (Yaw) | `D9` |
-| **Servo 2** | Vertical Tilt (Pitch) | `D10` |
-| **Servo 3** | Upper Eyelid | `D11` |
-| **Servo 4** | Lower Eyelid | `D12` |
+```bash
+git clone https://github.com/STARFALL088/Eyemech.git
+cd Eyemech/software
+python3 -m venv .venv && source .venv/bin/activate   # or: uv venv .venv
+pip install -r requirements.txt
+# desktop preview also needs:  pip install "opencv-python>=4.7,<5"
+# Linux Tk UI:  sudo apt install python3-tk
+```
 
----
-
-## 🚀 Quick Start
-
-### 1. Hardware Setup
-1. Print all STL files located in `/hardware/cad_models`.
-2. Assemble the gimbal base and attach the pitch/yaw linkages to the servo horns.
-3. Center all servos to **90°** before mounting linkage arms to ensure symmetrical travel.
-
-### 2. Firmware Installation
-1. Clone the repository:
+1. Flash `software/firmware/firmware.ino` (Arduino IDE / CLI, Servo library).
+2. Mouse control:
    ```bash
-   git clone [https://github.com/](https://github.com/)<your-username>/EyeMech.git
+   python direct_control.py
+   # pick port → Connect → move mouse on the pad
+   ```
+3. Iris / pupil control:
+   ```bash
+   python pupil_control.py --list-ports
+   python pupil_control.py --port /dev/ttyUSB0
+   # or without hardware:
+   python pupil_control.py --mock
+   ```
+
+More detail: [`software/README.md`](software/README.md).

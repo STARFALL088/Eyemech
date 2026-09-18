@@ -4,7 +4,8 @@
  * 6 servos on sequential digital pins:
  *   X / Y eyeball  +  4 eyelid blink servos
  *
- * Protocol (9600 baud), one line per command from direct_control.py:
+ * Protocol (9600 baud), one line per command from:
+ *   direct_control.py  (mouse pad)  or  pupil_control.py  (MediaPipe iris)
  *   "<right_deg>,<up_deg>\n"
  * Example:  "7.50,-3.20\n"
  *
