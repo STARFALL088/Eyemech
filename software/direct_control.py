@@ -9,8 +9,8 @@ Tkinter UI:
   * Circle pad: theta = s/r → degrees over serial
 
 Protocol (9600 baud), same as firmware:
-  "<right_deg>,<up_deg>\\n"   gaze (after zero offset)
-  "HOME\\n"                   park mechanical v=0 on clean disconnect
+  "<right_deg>,<up_deg>,1.00,1.00\\n"   gaze + lids open (no webcam)
+  "HOME\\n"                              park mechanical v=0 on clean disconnect
 """
 
 from __future__ import annotations
@@ -259,7 +259,7 @@ class DirectControlApp:
         sample = (round(right_deg, 2), round(up_deg, 2))
         if not force and sample == self._last_sent:
             return
-        line = f"{sample[0]:.2f},{sample[1]:.2f}\n"
+        line = f"{sample[0]:.2f},{sample[1]:.2f},1.00,1.00\n"
         try:
             self._ser.write(line.encode("ascii"))
             self._last_send_t = now

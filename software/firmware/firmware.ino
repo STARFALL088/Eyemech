@@ -1,9 +1,12 @@
 /*
- * Eyemech firmware — calibrated serial gaze control
+ * Eyemech firmware — calibrated serial gaze + lid control
  *
  * Protocol (9600 baud):
- *   "<right_deg>,<up_deg>\n"  — look command (0,0 = straight ahead / mid-range)
- *   "HOME\n"                  — park at calibrated zero (v=0 pose), then hold
+ *   "<right_deg>,<up_deg>\n"                      — gaze; lids unchanged
+ *   "<right_deg>,<up_deg>,<left_open>,<right_open>\n"
+ *       left_open / right_open ∈ [0,1]  (1=open, 0=closed) — person's L/R
+ *       drives mechanism UL/LL and UR/LR independently
+ *   "HOME\n"                                      — park at calibrated zero
  *
  * Calibrated ranges (from experimental sweep maps):
  *   D3  X:     0  .. 80     (mid / look-straight = 40)
@@ -14,7 +17,7 @@
  *   D11 LR:  blink open=130 / closed=180
  *
  * Gaze: host +right / +up map directly to servo (no axis negate).
- * Mechanical park HOME still uses experimental v=0: (0, 60, 180, 0, 0, 180).
+ * Lids follow host (no auto-blink); mechanical HOME = experimental v=0.
  */
 
 #include <Servo.h>
@@ -26,8 +29,6 @@
 const float MAX_TURN_X = 14.0;   // ±right  (L/R extremes)
 const float MAX_TURN_Y = 4.5;    // ±up     (U/D extremes)
 
-const unsigned long BLINK_INTERVAL_MS = 3000;
-const unsigned long BLINK_CLOSED_MS   = 150;
 const unsigned long BAUD = 9600;
 
 // ---------------------------------------------------------------------------
@@ -62,18 +63,20 @@ Servo servoX, servoY, blinkUL, blinkLL, blinkUR, blinkLR;
 
 float cmdRightDeg = 0.0;
 float cmdUpDeg    = 0.0;
+float cmdLeftOpen  = 1.0;
+float cmdRightOpen = 1.0;
 
 String serialBuffer;
 
-unsigned long lastBlinkAt  = 0;
-unsigned long blinkCloseAt = 0;
-bool lidsClosed = false;
-bool parkedHome = false;   // after HOME, ignore blink until next gaze cmd
+bool parkedHome = false;   // after HOME, hold until next gaze cmd
 
 // ---------------------------------------------------------------------------
 float safe_turn_axis(float angle, float limit) {
-  // Symmetric clamp to ±limit for one axis.
   return max(-limit, min(limit, angle));
+}
+
+float clampf(float v, float lo, float hi) {
+  return max(lo, min(hi, v));
 }
 
 // Map host degrees → calibrated servo angle (0 deg → MID, ±limit → ends).
@@ -88,26 +91,25 @@ int mapGazeToServo(float deg, int servoMin, int servoMax, int servoMid, float li
   return servoMid + (int)round((a / limit) * (servoMid - servoMin));
 }
 
+// open01: 1 = fully open endpoint, 0 = fully closed endpoint.
+int mapLidOpen(float open01, int openPos, int closedPos) {
+  float o = clampf(open01, 0.0f, 1.0f);
+  return (int)round(openPos * o + closedPos * (1.0f - o));
+}
+
 void applyGaze() {
   parkedHome = false;
   servoX.write(mapGazeToServo(cmdRightDeg, X_MIN, X_MAX, X_MID, MAX_TURN_X));
   servoY.write(mapGazeToServo(cmdUpDeg,    Y_MIN, Y_MAX, Y_MID, MAX_TURN_Y));
 }
 
-void setLidsOpen() {
-  blinkUL.write(UL_OPEN);
-  blinkLL.write(LL_OPEN);
-  blinkUR.write(UR_OPEN);
-  blinkLR.write(LR_OPEN);
-  lidsClosed = false;
-}
-
-void setLidsClosed() {
-  blinkUL.write(UL_CLOSED);
-  blinkLL.write(LL_CLOSED);
-  blinkUR.write(UR_CLOSED);
-  blinkLR.write(LR_CLOSED);
-  lidsClosed = true;
+void applyLids() {
+  parkedHome = false;
+  // Person's left → mechanism UL/LL; person's right → UR/LR.
+  blinkUL.write(mapLidOpen(cmdLeftOpen,  UL_OPEN, UL_CLOSED));
+  blinkLL.write(mapLidOpen(cmdLeftOpen,  LL_OPEN, LL_CLOSED));
+  blinkUR.write(mapLidOpen(cmdRightOpen, UR_OPEN, UR_CLOSED));
+  blinkLR.write(mapLidOpen(cmdRightOpen, LR_OPEN, LR_CLOSED));
 }
 
 void goHome() {
@@ -117,25 +119,12 @@ void goHome() {
   blinkLL.write(HOME_LL);
   blinkUR.write(HOME_UR);
   blinkLR.write(HOME_LR);
-  lidsClosed = false;
   parkedHome = true;
   cmdRightDeg = 0.0;
   cmdUpDeg    = 0.0;
+  cmdLeftOpen  = 1.0;
+  cmdRightOpen = 1.0;
   Serial.println("HOME");
-}
-
-void updateBlink() {
-  if (parkedHome) {
-    return;  // stay at home lids until next gaze command
-  }
-  unsigned long now = millis();
-  if (!lidsClosed && (now - lastBlinkAt >= BLINK_INTERVAL_MS)) {
-    setLidsClosed();
-    blinkCloseAt = now;
-    lastBlinkAt  = now;
-  } else if (lidsClosed && (now - blinkCloseAt >= BLINK_CLOSED_MS)) {
-    setLidsOpen();
-  }
 }
 
 void handleLine(const String& line) {
@@ -145,7 +134,6 @@ void handleLine(const String& line) {
     return;
   }
 
-  // Case-insensitive HOME
   String up = s;
   up.toUpperCase();
   if (up == "HOME") {
@@ -153,14 +141,27 @@ void handleLine(const String& line) {
     return;
   }
 
-  int comma = s.indexOf(',');
-  if (comma < 0) {
+  int c1 = s.indexOf(',');
+  if (c1 < 0) {
     return;
   }
-  cmdRightDeg = s.substring(0, comma).toFloat();
-  cmdUpDeg    = s.substring(comma + 1).toFloat();
+  int c2 = s.indexOf(',', c1 + 1);
+  cmdRightDeg = s.substring(0, c1).toFloat();
+  if (c2 < 0) {
+    cmdUpDeg = s.substring(c1 + 1).toFloat();
+    applyGaze();
+    return;
+  }
+  int c3 = s.indexOf(',', c2 + 1);
+  cmdUpDeg = s.substring(c1 + 1, c2).toFloat();
+  if (c3 < 0) {
+    applyGaze();
+    return;
+  }
+  cmdLeftOpen  = clampf(s.substring(c2 + 1, c3).toFloat(), 0.0f, 1.0f);
+  cmdRightOpen = clampf(s.substring(c3 + 1).toFloat(), 0.0f, 1.0f);
   applyGaze();
-  // If lids were left closed mid-blink when a cmd arrives, leave blink SM as-is.
+  applyLids();
 }
 
 void readSerial() {
@@ -192,11 +193,9 @@ void setup() {
 
   // Assume mechanism is already at HOME — do not write positions on boot.
   parkedHome = true;
-  lastBlinkAt = millis();
-  Serial.println("Eyemech firmware ready (calibrated)");
+  Serial.println("Eyemech firmware ready (gaze+lids)");
 }
 
 void loop() {
   readSerial();
-  updateBlink();
 }

@@ -190,7 +190,7 @@ def run(camera: int, width: int, height: int, model: str) -> int:
                 if not ok:
                     continue
                 ts_ms = int((time.time() - t0) * 1000)
-                annotated, info = process_frame(landmarker, frame, ts_ms)
+                annotated, info, _lids = process_frame(landmarker, frame, ts_ms)
 
                 th_r = th_u = 0.0
                 if info:

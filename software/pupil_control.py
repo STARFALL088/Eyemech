@@ -14,10 +14,13 @@ Angle math matches ``direct_control.py``: white orbit = sphere disk of radius
 (+right / +up). Angles are printed to the terminal, then degrees are sent
 with the same protocol as the mouse pad:
 
-  "<right_deg>,<up_deg>\\n"   @ 9600 baud
+  "<right_deg>,<up_deg>,<left_open>,<right_open>\\n"   @ 9600 baud
 
-Firmware (``firmware/firmware.ino``) clamps per axis
-(±14° X, ±4.5° Y from range calibrator).
+``left_open`` / ``right_open`` are person's eyes in [0,1] (1=open), from
+webcam EAR — independent wink / blink follows on the mechanism lids.
+
+Firmware (``firmware/firmware.ino``) clamps gaze per axis
+(±14° X, ±4.5° Y from range calibrator) and maps lid openness to servos.
 
 Honest note on reliability
 --------------------------
@@ -96,6 +99,22 @@ RIGHT_ORBIT: Sequence[int] = (
 LEFT_IRIS: Sequence[int] = (468, 469, 470, 471, 472)
 RIGHT_IRIS: Sequence[int] = (473, 474, 475, 476, 477)
 
+# Eye Aspect Ratio samples (outer, inner, u1, l1, u2, l2).
+# After cv2.flip(1): LEFT_* = image-left = person's right; RIGHT_* = person's left.
+EAR_IMG_LEFT: Sequence[int] = (33, 133, 160, 144, 158, 153)   # → mech right
+EAR_IMG_RIGHT: Sequence[int] = (263, 362, 387, 373, 385, 380)  # → mech left
+
+# Map EAR → lid openness (tune if blinks feel sticky / twitchy).
+EAR_CLOSED = 0.15
+EAR_OPEN = 0.25
+LID_SMOOTH = 0.45  # EMA toward new sample (higher = snappier)
+
+# Looking down naturally narrows the lids; boost openness so Eyemech
+# does not treat down-gaze squint as a blink/close.
+DOWN_LID_BIAS_START_DEG = -0.8   # begin bias a little below home (up_deg)
+DOWN_LID_BIAS_MAX = 0.35         # added openness at full down (clamped to 1)
+# Full bias at MAX_TURN_Y down — see down_gaze_lid_bias().
+
 MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/"
     "face_landmarker/face_landmarker/float16/1/face_landmarker.task"
@@ -153,6 +172,73 @@ def fit_circle(pts: Sequence[Point]) -> Tuple[Point, float]:
     radii = [math.hypot(x - cx, y - cy) for x, y in pts]
     r = sum(radii) / len(radii)
     return (cx, cy), max(1.0, r)
+
+
+def eye_aspect_ratio(
+    landmarks, indices: Sequence[int], width: int, height: int
+) -> float:
+    """Classic 6-point EAR; lower ⇒ more closed."""
+    pts = [landmark_xy(landmarks, i, width, height) for i in indices]
+    # outer, inner, u1, l1, u2, l2
+    vert = math.hypot(pts[2][0] - pts[3][0], pts[2][1] - pts[3][1]) + math.hypot(
+        pts[4][0] - pts[5][0], pts[4][1] - pts[5][1]
+    )
+    horiz = math.hypot(pts[0][0] - pts[1][0], pts[0][1] - pts[1][1])
+    if horiz < 1e-3:
+        return 0.0
+    return vert / (2.0 * horiz)
+
+
+def ear_to_openness(ear: float) -> float:
+    """Map EAR into [0,1] lid openness (1 = open)."""
+    if EAR_OPEN <= EAR_CLOSED:
+        return 1.0
+    t = (ear - EAR_CLOSED) / (EAR_OPEN - EAR_CLOSED)
+    return max(0.0, min(1.0, t))
+
+
+def down_gaze_lid_bias(up_deg: float) -> float:
+    """
+    Extra lid openness when gaze is below home.
+
+    Linear ramp from 0 at DOWN_LID_BIAS_START_DEG to DOWN_LID_BIAS_MAX at
+    -MAX_TURN_Y. Above the start threshold (near home / up), bias is 0.
+    """
+    if up_deg >= DOWN_LID_BIAS_START_DEG:
+        return 0.0
+    full_down = -MAX_TURN_Y
+    span = DOWN_LID_BIAS_START_DEG - full_down
+    if span <= 1e-6:
+        return DOWN_LID_BIAS_MAX
+    t = (DOWN_LID_BIAS_START_DEG - up_deg) / span
+    return max(0.0, min(1.0, t)) * DOWN_LID_BIAS_MAX
+
+
+def apply_lid_openness_bias(
+    left_open: float, right_open: float, up_deg: float
+) -> Tuple[float, float]:
+    """Keep lids more open than raw EAR when looking downward."""
+    bias = down_gaze_lid_bias(up_deg)
+    return (
+        max(0.0, min(1.0, left_open + bias)),
+        max(0.0, min(1.0, right_open + bias)),
+    )
+
+
+def person_lid_openness(
+    landmarks, width: int, height: int
+) -> Tuple[float, float]:
+    """
+    Returns (person_left_open, person_right_open) in [0,1].
+
+    Image is already mirrored for MediaPipe, so image-right landmarks are the
+    person's left eye (mechanism left lids).
+    """
+    ear_img_l = eye_aspect_ratio(landmarks, EAR_IMG_LEFT, width, height)
+    ear_img_r = eye_aspect_ratio(landmarks, EAR_IMG_RIGHT, width, height)
+    person_right = ear_to_openness(ear_img_l)
+    person_left = ear_to_openness(ear_img_r)
+    return person_left, person_right
 
 
 def pupil_sphere_angles(
@@ -250,7 +336,7 @@ def create_landmarker(model_path: str) -> mp_vision.FaceLandmarker:
 
 
 class FirmwareSender:
-    """Sends ``right_deg,up_deg\\n`` to Arduino (or stdout in mock mode)."""
+    """Sends ``right_deg,up_deg,left_open,right_open\\n`` (or stdout in mock)."""
 
     def __init__(self, baud: int = BAUD, mock: bool = False) -> None:
         self.mock = mock
@@ -258,7 +344,9 @@ class FirmwareSender:
         self.port: Optional[str] = None
         self._ser = None
         self._last_send_t = 0.0
-        self._last_sent: Optional[Tuple[float, float]] = None
+        self._last_sent: Optional[Tuple[float, float, float, float]] = None
+        self.left_open = 1.0
+        self.right_open = 1.0
 
     @property
     def connected(self) -> bool:
@@ -279,16 +367,32 @@ class FirmwareSender:
         self._last_sent = None
         print(f"[pupil_control] serial open {port} @ {self.baud}", file=sys.stderr)
 
-    def send(self, right_deg: float, up_deg: float, force: bool = False) -> None:
+    def send(
+        self,
+        right_deg: float,
+        up_deg: float,
+        left_open: Optional[float] = None,
+        right_open: Optional[float] = None,
+        force: bool = False,
+    ) -> None:
         if not self.connected:
             return
+        if left_open is not None:
+            self.left_open = max(0.0, min(1.0, float(left_open)))
+        if right_open is not None:
+            self.right_open = max(0.0, min(1.0, float(right_open)))
         now = time.monotonic()
         if not force and (now - self._last_send_t) < SEND_INTERVAL_S:
             return
-        sample = (round(right_deg, 2), round(up_deg, 2))
+        sample = (
+            round(right_deg, 2),
+            round(up_deg, 2),
+            round(self.left_open, 2),
+            round(self.right_open, 2),
+        )
         if not force and sample == self._last_sent:
             return
-        line = f"{sample[0]:.2f},{sample[1]:.2f}\n"
+        line = f"{sample[0]:.2f},{sample[1]:.2f},{sample[2]:.2f},{sample[3]:.2f}\n"
         if self.mock:
             sys.stdout.write(line)
             sys.stdout.flush()
@@ -390,7 +494,11 @@ def process_frame(
     landmarker: mp_vision.FaceLandmarker,
     frame_bgr: np.ndarray,
     timestamp_ms: int,
-) -> Tuple[np.ndarray, List[dict]]:
+) -> Tuple[np.ndarray, List[dict], Tuple[float, float]]:
+    """
+    Returns (annotated_frame, eye_info, (person_left_open, person_right_open)).
+    Lid openness defaults to fully open when no face.
+    """
     h, w = frame_bgr.shape[:2]
     frame_bgr = cv2.flip(frame_bgr, 1)
     rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
@@ -398,6 +506,7 @@ def process_frame(
 
     result = landmarker.detect_for_video(mp_image, timestamp_ms)
     info: List[dict] = []
+    lids: Tuple[float, float] = (1.0, 1.0)
 
     if result.face_landmarks:
         lms = result.face_landmarks[0]
@@ -407,14 +516,24 @@ def process_frame(
             info.append({"side": "L", **left})
         if right:
             info.append({"side": "R", **right})
+        lids = person_lid_openness(lms, w, h)
 
         cv2.putText(
             frame_bgr,
-            "white orbit + iris",
+            "white orbit + iris + lids",
             (10, 28),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
+            0.65,
             (255, 255, 255),
+            2,
+        )
+        cv2.putText(
+            frame_bgr,
+            f"lids L={lids[0]:.2f} R={lids[1]:.2f}",
+            (10, 112),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (200, 200, 255),
             2,
         )
     else:
@@ -428,7 +547,7 @@ def process_frame(
             2,
         )
 
-    return frame_bgr, info
+    return frame_bgr, info, lids
 
 
 def run_image(path: str, model_path: str, out: Optional[str]) -> int:
@@ -438,7 +557,7 @@ def run_image(path: str, model_path: str, out: Optional[str]) -> int:
         return 1
     model_path = ensure_model(model_path)
     with create_landmarker(model_path) as landmarker:
-        annotated, info = process_frame(landmarker, img, timestamp_ms=0)
+        annotated, info, lids = process_frame(landmarker, img, timestamp_ms=0)
     for e in info:
         th_r, th_u = pupil_sphere_angles(e["eye_c"], e["eye_r"], e["pupil_c"])
         print(
@@ -624,7 +743,7 @@ class ControlPanel:
             self.calib.gaze_r = 0.0
             self.calib.gaze_u = 0.0
             print(
-                "[pupil_control] Stop — arrows only (webcam does not drive)",
+                "[pupil_control] Stop — arrows for gaze; lids still follow webcam",
                 file=sys.stderr,
             )
             if self.sender.connected:
@@ -747,7 +866,7 @@ def run_camera(args: argparse.Namespace) -> int:
         f"[pupil_control] camera={args.camera}  "
         f"iris θ→deg (R{IRIS_MAX_RIGHT}/L{IRIS_MAX_LEFT}/U{IRIS_MAX_UP}/D{IRIS_MAX_DOWN}) "
         f"→ ±{MAX_TURN_X}°/±{MAX_TURN_Y}° — "
-        f"Connect → arrows; Start → iris follow; 'q' quits",
+        f"Connect → arrows + live lids; Start → iris follow; 'q' quits",
         file=sys.stderr,
     )
 
@@ -757,6 +876,8 @@ def run_camera(args: argparse.Namespace) -> int:
     t0 = time.time()
     no_face = 0
     last_print_t = 0.0
+    smooth_l = 1.0
+    smooth_r = 1.0
     with create_landmarker(model_path) as landmarker:
         try:
             while True:
@@ -767,10 +888,11 @@ def run_camera(args: argparse.Namespace) -> int:
                 if not ok:
                     continue
                 ts = int((time.time() - t0) * 1000)
-                annotated, info = process_frame(landmarker, frame, ts)
+                annotated, info, lids = process_frame(landmarker, frame, ts)
 
                 cmd_r, cmd_u = calib.command()
                 th_r = th_u = 0.0
+                left_o, right_o = lids
 
                 if info:
                     no_face = 0
@@ -780,8 +902,16 @@ def run_camera(args: argparse.Namespace) -> int:
                     right_deg, up_deg = map_iris_theta_to_degrees(th_r, th_u)
                     # Only updates gaze when tracking==True (after Start).
                     cmd_r, cmd_u = calib.set_gaze(right_deg, up_deg)
+                    left_o, right_o = apply_lid_openness_bias(
+                        left_o, right_o, up_deg
+                    )
+                    smooth_l = LID_SMOOTH * left_o + (1.0 - LID_SMOOTH) * smooth_l
+                    smooth_r = LID_SMOOTH * right_o + (1.0 - LID_SMOOTH) * smooth_r
                 else:
                     no_face += 1
+                    # No face → open lids; optionally park gaze if tracking.
+                    smooth_l = LID_SMOOTH * 1.0 + (1.0 - LID_SMOOTH) * smooth_l
+                    smooth_r = LID_SMOOTH * 1.0 + (1.0 - LID_SMOOTH) * smooth_r
                     if (
                         calib.tracking
                         and sender.connected
@@ -795,7 +925,8 @@ def run_camera(args: argparse.Namespace) -> int:
                     mode = "TRACK" if calib.tracking else "ARROWS"
                     print(
                         f"{format_angles(th_r, th_u)}  "
-                        f"cmd=({cmd_r:+.1f},{cmd_u:+.1f})  [{link}/{mode}]",
+                        f"cmd=({cmd_r:+.1f},{cmd_u:+.1f})  "
+                        f"lids=({smooth_l:.2f},{smooth_r:.2f})  [{link}/{mode}]",
                         flush=True,
                     )
                     last_print_t = now
@@ -810,24 +941,25 @@ def run_camera(args: argparse.Namespace) -> int:
                     2,
                 )
                 if sender.connected:
-                    mode = "TRACKING" if calib.tracking else "ARROWS ONLY"
+                    mode = "TRACKING" if calib.tracking else "ARROWS + LIDS"
                     color = (0, 255, 0) if calib.tracking else (255, 200, 0)
                 else:
                     mode = "Not Connected"
                     color = (0, 0, 255)
                 cv2.putText(
                     annotated,
-                    f"send {cmd_r:+.1f},{cmd_u:+.1f}  {mode}",
+                    f"send {cmd_r:+.1f},{cmd_u:+.1f}  "
+                    f"L{smooth_l:.2f}/R{smooth_r:.2f}  {mode}",
                     (10, 84),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    0.55,
+                    0.5,
                     color,
                     2,
                 )
 
-                # Iris serial only after Start; arrows always send via button handlers.
-                if sender.connected and calib.tracking:
-                    sender.send(cmd_r, cmd_u)
+                # Gaze from iris only after Start; lids always follow when connected.
+                if sender.connected:
+                    sender.send(cmd_r, cmd_u, smooth_l, smooth_r)
 
                 cv2.imshow(win, annotated)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
