@@ -5,10 +5,11 @@ Eyemech — realtime pupil / iris control (MediaPipe → Arduino)
 
 Opens the webcam, runs MediaPipe Face Landmarker (478 points + iris), and
 draws for each eye:
-  * a larger circle fitted to the eye opening
-  * a smaller circle on the iris (used as the practical "pupil" marker)
+  * a larger white circle fitted to the periocular orbit (halo x3; θ ref)
+  * a smaller red circle on the iris (practical "pupil" marker)
+  * faint green eyelid contour (visual only; not used for θ)
 
-Angle math matches ``direct_control.py``: eye circle = sphere disk of radius
+Angle math matches ``direct_control.py``: white orbit = sphere disk of radius
 ``r``, pupil center = point; ``s = r * theta`` so ``theta = s / r``
 (+right / +up). Angles are printed to the terminal, then degrees are sent
 with the same protocol as the mouse pad:
@@ -81,6 +82,17 @@ LEFT_EYE: Sequence[int] = (
 RIGHT_EYE: Sequence[int] = (
     362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398,
 )
+# Periocular “halo x3” — stable socket outer (not eyelid / glasses).
+LEFT_ORBIT: Sequence[int] = (
+    33, 133,
+    226, 31, 228, 229, 230, 231, 232, 233, 244,
+    113, 225, 224, 223, 222, 221, 189,
+)
+RIGHT_ORBIT: Sequence[int] = (
+    263, 362,
+    446, 261, 448, 449, 450, 451, 452, 453, 464,
+    342, 445, 444, 443, 442, 441, 413,
+)
 LEFT_IRIS: Sequence[int] = (468, 469, 470, 471, 472)
 RIGHT_IRIS: Sequence[int] = (473, 474, 475, 476, 477)
 
@@ -98,12 +110,12 @@ MAX_TURN_X = 14.0
 MAX_TURN_Y = 4.5
 NUDGE_DEG = 1.0
 
-# Iris θ extremes from eye_calibrate.py (unit-disk s/r). Full natural look
-# in each direction maps to ±MAX_TURN_*. D was 0 in the session → mirror U.
-IRIS_MAX_RIGHT = 0.3350
-IRIS_MAX_LEFT = 0.5186   # magnitude of left extreme (θ was -0.5186)
-IRIS_MAX_UP = 0.2124
-IRIS_MAX_DOWN = 0.2124   # mirrored from up (down was not recorded)
+# Iris θ extremes from eye_calibrate.py vs white periocular orbit (unit-disk s/r).
+# Full natural look in each direction maps to ±MAX_TURN_*.
+IRIS_MAX_RIGHT = 0.3098
+IRIS_MAX_LEFT = 0.3226   # magnitude of left extreme (θ was -0.3226)
+IRIS_MAX_UP = 0.2106
+IRIS_MAX_DOWN = 0.1200   # magnitude of down extreme (θ was -0.1200)
 
 
 Point = Tuple[float, float]
@@ -336,21 +348,30 @@ def list_ports() -> None:
 def draw_eye(
     frame: np.ndarray,
     landmarks,
-    eye_idx: Sequence[int],
+    orbit_idx: Sequence[int],
+    eyelid_idx: Sequence[int],
     iris_idx: Sequence[int],
     width: int,
     height: int,
 ) -> Optional[dict]:
-    """Draw eye circle + iris/pupil circle. Returns pixel centers/radii."""
-    eye_pts = points_from_indices(landmarks, eye_idx, width, height)
+    """
+    White periocular orbit = θ reference; red iris unchanged.
+    Green eyelid polyline is visual-only.
+    """
+    orbit_pts = points_from_indices(landmarks, orbit_idx, width, height)
+    eyelid_pts = points_from_indices(landmarks, eyelid_idx, width, height)
     iris_pts = points_from_indices(landmarks, iris_idx, width, height)
 
-    (ex, ey), er = fit_circle(eye_pts)
+    (ex, ey), er = fit_circle(orbit_pts)
     (px, py), pr = fit_circle(iris_pts)
 
-    poly = np.array([(int(round(x)), int(round(y))) for x, y in eye_pts], dtype=np.int32)
-    cv2.polylines(frame, [poly], isClosed=True, color=(0, 200, 0), thickness=1)
-    cv2.circle(frame, (int(round(ex)), int(round(ey))), int(round(er)), (0, 255, 0), 2)
+    poly = np.array(
+        [(int(round(x)), int(round(y))) for x, y in eyelid_pts], dtype=np.int32
+    )
+    cv2.polylines(frame, [poly], isClosed=True, color=(0, 180, 0), thickness=1)
+    cv2.circle(
+        frame, (int(round(ex)), int(round(ey))), int(round(er)), (255, 255, 255), 2
+    )
 
     cv2.circle(frame, (int(round(px)), int(round(py))), int(round(pr)), (0, 0, 255), 2)
     cv2.circle(frame, (int(round(px)), int(round(py))), 2, (0, 0, 255), -1)
@@ -380,8 +401,8 @@ def process_frame(
 
     if result.face_landmarks:
         lms = result.face_landmarks[0]
-        left = draw_eye(frame_bgr, lms, LEFT_EYE, LEFT_IRIS, w, h)
-        right = draw_eye(frame_bgr, lms, RIGHT_EYE, RIGHT_IRIS, w, h)
+        left = draw_eye(frame_bgr, lms, LEFT_ORBIT, LEFT_EYE, LEFT_IRIS, w, h)
+        right = draw_eye(frame_bgr, lms, RIGHT_ORBIT, RIGHT_EYE, RIGHT_IRIS, w, h)
         if left:
             info.append({"side": "L", **left})
         if right:
@@ -389,11 +410,11 @@ def process_frame(
 
         cv2.putText(
             frame_bgr,
-            "MediaPipe iris lock",
+            "white orbit + iris",
             (10, 28),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.7,
-            (0, 255, 0),
+            (255, 255, 255),
             2,
         )
     else:

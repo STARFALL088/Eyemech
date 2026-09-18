@@ -3,8 +3,9 @@
 Eyemech — eye / iris range calibrator (webcam only, no Arduino)
 ===============================================================
 
-Opens the webcam, runs the same MediaPipe iris geometry as pupil_control
-(theta = s/r on the unit disk), and records peak offsets:
+Opens the webcam, runs the same MediaPipe geometry as pupil_control
+(white periocular orbit + red iris; theta = s/r on the unit disk), and
+records peak offsets:
 
   max_right, max_left, max_up, max_down   (unit-disk fractions, typically |x|<1)
 
@@ -50,7 +51,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 class ThetaExtremeLog:
-    """Peak unit-disk iris offsets (theta = s/r)."""
+    """Peak unit-disk iris offsets (theta = s/r vs white orbit)."""
 
     def __init__(self, path: str) -> None:
         self.path = path
@@ -93,6 +94,7 @@ class ThetaExtremeLog:
         stamp = datetime.now().isoformat(timespec="seconds")
         body = (
             f"# Eyemech eye_calib_limits — unit-disk iris theta (s/r)\n"
+            f"# outer_ref=white_periocular_halo_x3 (not green eyelid)\n"
             f"# updated={stamp}\n"
             f"# Look to extremes; hand this file back to scale pupil_control mapping.\n"
             f"max_right={self.max_right:.6f}\n"
@@ -121,7 +123,7 @@ class StatusPanel:
 
         bar = ttk.Frame(self.root, padding=8)
         bar.pack()
-        ttk.Label(bar, text="Iris θ extremes:").pack(side=tk.LEFT)
+        ttk.Label(bar, text="Iris θ extremes (white orbit):").pack(side=tk.LEFT)
         self.limits_var = tk.StringVar(value=log.summary())
         ttk.Label(bar, textvariable=self.limits_var).pack(side=tk.LEFT, padx=(6, 8))
         ttk.Button(bar, text="Reset", command=self._reset).pack(side=tk.LEFT)
@@ -170,7 +172,7 @@ def run(camera: int, width: int, height: int, model: str) -> int:
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
 
     print(
-        f"[eye_calibrate] logging → {path}\n"
+        f"[eye_calibrate] white periocular outer; logging → {path}\n"
         f"  Look hard LEFT / RIGHT / UP / DOWN. Press 'q' to quit.",
         file=sys.stderr,
     )
@@ -239,7 +241,9 @@ def run(camera: int, width: int, height: int, model: str) -> int:
 
 
 def main(argv: Optional[list] = None) -> int:
-    p = argparse.ArgumentParser(description="Record max iris θ (unit disk), no Arduino.")
+    p = argparse.ArgumentParser(
+        description="Record max iris θ vs white periocular outer (no Arduino)."
+    )
     p.add_argument("--camera", type=int, default=0)
     p.add_argument("--width", type=int, default=1280)
     p.add_argument("--height", type=int, default=720)

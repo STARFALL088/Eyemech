@@ -1,6 +1,7 @@
 # Eyemech eye_calib_limits — unit-disk iris theta (s/r)
-# From eye_calibrate session (D was 0 → pupil_control mirrors U for down).
-max_right=0.3350
-max_left=-0.5186
-max_up=0.2124
-max_down=0.0000
+# outer_ref=white_periocular_halo_x3 (not green eyelid)
+# From eye_calibrate session 2026-09-18 (white orbit); used by pupil_control.
+max_right=0.3098
+max_left=-0.3226
+max_up=0.2106
+max_down=-0.1200

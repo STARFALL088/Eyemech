@@ -13,7 +13,7 @@
  *   D10 UR:  blink open=50  / closed=0
  *   D11 LR:  blink open=130 / closed=180
  *
- * Gaze axes are flipped vs host +right/+up (negate before mapping).
+ * Gaze: host +right / +up map directly to servo (no axis negate).
  * Mechanical park HOME still uses experimental v=0: (0, 60, 180, 0, 0, 180).
  */
 
@@ -90,9 +90,8 @@ int mapGazeToServo(float deg, int servoMin, int servoMax, int servoMid, float li
 
 void applyGaze() {
   parkedHome = false;
-  // Flip both axes relative to host +right / +up.
-  servoX.write(mapGazeToServo(-cmdRightDeg, X_MIN, X_MAX, X_MID, MAX_TURN_X));
-  servoY.write(mapGazeToServo(-cmdUpDeg,    Y_MIN, Y_MAX, Y_MID, MAX_TURN_Y));
+  servoX.write(mapGazeToServo(cmdRightDeg, X_MIN, X_MAX, X_MID, MAX_TURN_X));
+  servoY.write(mapGazeToServo(cmdUpDeg,    Y_MIN, Y_MAX, Y_MID, MAX_TURN_Y));
 }
 
 void setLidsOpen() {
