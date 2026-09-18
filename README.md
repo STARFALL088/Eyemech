@@ -9,9 +9,8 @@ eyelid blink servos, driven from a PC over USB-serial.
 |------|--------|--------|
 | Mouse pad | `software/direct_control.py` | Tkinter circle pad → degrees over serial |
 | Iris / pupil | `software/pupil_control.py` | Webcam + MediaPipe iris → same serial protocol |
-| Legacy OpenCV | `software/eyemech_gaze.py` | Haar face/pupil → old `0..1023` protocol (PCA9685 sketch) |
 
-Preferred firmware for the first two modes: **`software/firmware/firmware.ino`**.
+Firmware: **`software/firmware/firmware.ino`**.
 
 ## Protocol (new firmware)
 

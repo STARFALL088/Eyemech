@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+.env
+
+# MediaPipe model (auto-downloaded by pupil_control.py)
+software/models/*.task
+
+# Generated / local artifacts
+software/test_face_pupil.jpg
+*.pyc
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
