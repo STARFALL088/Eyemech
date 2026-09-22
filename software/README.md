@@ -16,10 +16,11 @@ Two **supported** ways to drive `firmware/firmware.ino` over USB-serial
 - Host angles are clamped per axis from mechanism calibration: **±14° X**, **±4.5° Y**,
   then mapped onto each eyeball’s calibrated min…max (X: 0–80, Y: 60–120)
 - `pupil_control.py` scales iris θ by measured extremes (see `eye_calib_limits.txt`:
-  R≈0.34, L≈0.52, U≈0.21) so a full natural look hits those host limits
+  R 0.3098, L 0.3226, U 0.2106, D 0.1200) so a full natural look hits those host limits
 
-Firmware auto-blinks eyelids using calibrated open/closed endpoints.
-On boot it **assumes** the mechanism is already at HOME (does not drive there).
+Lids follow the host (`left_open` / `right_open` in `[0,1]` from webcam EAR) —
+no firmware auto-blink.
+On boot firmware **assumes** the mechanism is already at HOME (does not drive there).
 
 ## Install
 
@@ -68,13 +69,14 @@ scale `pupil_control` mapping to your real iris travel.
 ## MediaPipe iris / pupil
 
 Tracks iris center inside each eye (reliable realtime proxy for “pupil”),
-draws green eye circles + red iris circles. For each eye, pupil center vs
-eye-circle center uses the same ``θ = s / r`` math as the mouse pad; L/R
-are averaged, printed to the terminal (rad + deg), then clamped to
-±`--max-turn` and sent to the Arduino.
+draws white periocular orbit + red iris circles + faint green eyelid contour
+(visual only). For each eye, pupil center vs orbit center uses the same
+``θ = s / r`` math as the mouse pad; L/R are averaged, scaled by calibrated
+iris extremes to host degrees (see below), then clamped to ±14.0° X / ±4.5° Y
+and sent to the Arduino with independent L/R lid openness from EAR.
 
 ```bash
-# Preview / drive — Connect from the control window
+# Preview / drive — Connect from the control window, then Start for iris follow
 python pupil_control.py
 python pupil_control.py --port /dev/ttyUSB0   # optional auto-connect
 python pupil_control.py --port COM5 --invert-y
@@ -86,18 +88,32 @@ python pupil_control.py --list-ports
 python pupil_control.py --image test_face.jpg
 ```
 
+Flow: **Connect → arrows-only + lids follow webcam → Start → iris follow.**
+`q` in the webcam window quits. No face for > `--lose-timeout` frames while
+tracking recenters gaze to `0,0` with lids open. Lids are EAR-driven
+(`EAR_CLOSED=0.15` → closed, `EAR_OPEN=0.25` → open, EMA `LID_SMOOTH=0.45`)
+plus a down-gaze bias (up to +0.35 at full down) so looking down isn't read
+as a blink.
+
 | Flag | Default | Meaning |
 |------|---------|---------|
 | `--port` | none | Serial device; omit = preview only |
-| `--mock` | off | Write `right_deg,up_deg` to stdout |
+| `--mock` | off | Write `right_deg,up_deg,left_open,right_open` to stdout |
 | `--baud` | 9600 | Must match firmware |
-| `--max-turn` | 15 | Degrees at full iris offset |
 | `--gain` | 1.0 | Amplify iris offsets |
 | `--invert-y` | off | Flip vertical if mounting is mirrored |
 | `--lose-timeout` | 15 | Frames without face before sending `0,0` |
 | `--camera` | 0 | Webcam index |
+| `--width` / `--height` | 1280 / 720 | Capture size (0 = leave default) |
+| `--image` / `--out` | none | Still-image test instead of webcam |
+| `--model` | `models/face_landmarker.task` | Auto-downloaded if missing |
+
+Host limits are constants (`MAX_TURN_X=14.0`, `MAX_TURN_Y=4.5`), not flags —
+they come from `calibrate.py`. Iris θ extremes are constants
+(`R 0.3098 / L 0.3226 / U 0.2106 / D 0.1200` from `eye_calib_limits.txt`):
+full natural look in each direction maps to the host limits above.
 
 ## Firmware
 
-Flash [`firmware/firmware.ino`](firmware/firmware.ino). Named pins D2–D7
-(X, Y, four blink lids). See root [`README.md`](../README.md) for the table.
+Flash [`firmware/firmware.ino`](firmware/firmware.ino). Pins D3/D5
+(X, Y) + D6/D9/D10/D11 (four blink lids). See root [`README.md`](../README.md) for the table.
